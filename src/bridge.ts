@@ -64,26 +64,25 @@ export class SessionBridge {
     this.queue.enqueue(sessionId, () => this.process(pkt, ws, sessionId))
   }
 
-  // ── 事件入口：欢迎语 / 点赞点踩，不走消息队列 ─────────
+  // ── 事件入口：欢迎语 / 反馈，不走消息队列 ─────────
   handleEvent(pkt: WecomCallbackPacket, ws: WsClient) {
     const reqId = pkt.headers.req_id
-    const evt = pkt.body.event_type   // ⚠️ 字段名以文档「事件回调」一节为准
+    const evt = pkt.body?.event?.eventtype   // 官方格式：body.event.eventtype（如 enter_chat）
 
     switch (evt) {
-      case 'enter_session': {
+      case 'enter_chat': {
         const welcome = this.cfg.welcomeText
           ?? '你好！我是智能助手，有什么可以帮你？'
         ws.respondWelcome(reqId, welcome)
         break
       }
-      case 'like':
-      case 'dislike': {
+      case 'feedback_event': {
         // 接审计日志，不影响用户体验
         this.logger().info('feedback event: %o', pkt.body)
         break
       }
       default:
-        this.logger().debug('unhandled event: %s', evt)
+        this.logger().info('unhandled event: %s', evt)
     }
   }
 

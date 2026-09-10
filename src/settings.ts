@@ -20,8 +20,8 @@ export const WecomSettingsSchema: z<WecomSettings> = z.object({
   allowFrom: z.array(z.string()).default([]).description(
     '允许的 userid/chatid 白名单，留空或 ["*"] 则表示允许所有',
   ),
-  preset: z.string().default('default').description(
-    'Agent 使用的 dsh preset 名称',
+  preset: z.string().default('standard').description(
+    'Agent 使用的 dsh preset 名称（standard / ptc / minimal / cordis）',
   ),
   replyMode: z.union([z.const('markdown'), z.const('stream')]).default('stream').description(
     '回复模式：markdown 一次性返回 / stream 流式打字机',
@@ -30,6 +30,6 @@ export const WecomSettingsSchema: z<WecomSettings> = z.object({
     '会话空闲超时（毫秒）',
   ),
   welcomeText: z.string().description(
-    '用户进入会话时的欢迎语（markdown），留空使用默认文案',
+    '用户进入会话时的欢迎语（纯文本，企微欢迎语不支持 markdown），留空使用默认文案',
   ),
 })

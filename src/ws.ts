@@ -5,10 +5,18 @@ import { WebSocket } from 'ws'
 import { randomUUID } from 'node:crypto'
 
 const WS_URL = 'wss://openws.work.weixin.qq.com'
-const HEARTBEAT_INTERVAL_MS = 30_000   // 以官方文档「保持心跳」一节为准
+const HEARTBEAT_INTERVAL_MS = 30_000   // 官方文档「保持心跳」：建议 30s
 const HEARTBEAT_TIMEOUT_MS  = 10_000
 const MAX_BACKOFF_MS        = 60_000
 const STREAM_THROTTLE_MS    = 500      // 流式推送节流
+
+/**
+ * req_id 生成：带命令前缀。无 cmd 的服务端回执（订阅响应/心跳响应）
+ * 靠 req_id 前缀区分类型（同官方 @wecom/aibot-node-sdk 的做法）。
+ */
+function buildReqId(prefix: string): string {
+  return `${prefix}_${Date.now()}_${randomUUID().replace(/-/g, '').slice(0, 8)}`
+}
 
 export interface WecomConfig {
   botId: string
@@ -19,6 +27,9 @@ export interface WecomCallbackPacket {
   cmd: string
   headers: { req_id: string }
   body: any
+  /** 无 cmd 回执帧携带：errcode / errmsg */
+  errcode?: number
+  errmsg?: string
 }
 
 export class WsClient extends EventEmitter {
@@ -39,7 +50,7 @@ export class WsClient extends EventEmitter {
 
   stop() {
     this.stopping = true
-    clearTimeout(this.hbTimer)
+    clearInterval(this.hbTimer)
     clearTimeout(this.pongTimer)
     this.ws?.close(1000, 'plugin dispose')
   }
@@ -72,13 +83,13 @@ export class WsClient extends EventEmitter {
     // error 后必触发 close，重连统一在 close 处理，避免双重连
   }
 
-  // ── 订阅帧（字段名以文档「订阅请求」一节为准）──────────
+  // ── 订阅帧（官方文档「订阅请求」：body.bot_id，非 aibotid）──────────
   private buildSubscribe() {
     return {
       cmd: 'aibot_subscribe',
-      headers: { req_id: randomUUID() },
+      headers: { req_id: buildReqId('aibot_subscribe') },
       body: {
-        aibotid: this.cfg.botId,
+        bot_id: this.cfg.botId,
         secret: this.cfg.secret,   // 仅此帧携带 secret，日志严禁打印 body
       },
     }
@@ -86,27 +97,47 @@ export class WsClient extends EventEmitter {
 
   // ── 分发 ───────────────────────────────────────────────
   private dispatch(pkt: WecomCallbackPacket) {
+    // 任何来帧都证明链路存活，取消本轮心跳超时（否则即使服务端正常回 pong，
+    // pongTimer 也无人清除，连接会在每个心跳周期后被误杀 → 无限重连循环）
+    clearTimeout(this.pongTimer)
     switch (pkt.cmd) {
-      case 'aibot_subscribe_response':   // 订阅结果（字段名以实际响应为准）
-        this.retry = 0
-        this.logger.info('subscribed ok')
-        this.emit('subscribed')
-        break
-
       case 'aibot_msg_callback':
-        this.logger.debug('msg received: msgtype=%s msgid=%s', pkt.body?.msgtype, pkt.body?.msgid)
+        this.logger.info('msg received: msgtype=%s msgid=%s', pkt.body?.msgtype, pkt.body?.msgid)
         this.emit('message', pkt)
         break
 
       case 'aibot_event_callback':       // 进入会话/点赞点踩等事件
-        this.logger.debug('event received: event_type=%s', pkt.body?.event_type)
+        this.logger.info('event received: eventtype=%s', pkt.body?.event?.eventtype)
         this.emit('event', pkt)
         break
 
-      default:
-        // pong / 未知 cmd → 交给 raw 监听（订阅失败时用于排查）
+      default: {
+        // 无 cmd 的回执帧（订阅响应 / 心跳响应 / 回复消息回执）：
+        // 形如 { headers: { req_id }, errcode, errmsg }，靠 req_id 前缀区分
+        const reqId: string = pkt.headers?.req_id ?? ''
+        if (reqId.startsWith('aibot_subscribe')) {
+          this.handleSubscribeResponse(pkt)
+          break
+        }
+        if (reqId.startsWith('ping')) {
+          if (pkt.errcode !== 0) this.logger.warn('heartbeat ack error: errcode=%s errmsg=%s', pkt.errcode, pkt.errmsg)
+          break
+        }
+        // 回复消息的回执等其余帧 → 交给 raw 监听（含 errcode，排查回复失败）
         this.emit('raw', pkt)
+      }
     }
+  }
+
+  private handleSubscribeResponse(pkt: WecomCallbackPacket) {
+    if (pkt.errcode !== 0) {
+      this.logger.error('subscribe failed: errcode=%s errmsg=%s', pkt.errcode, pkt.errmsg)
+      this.ws?.terminate()   // 触发 close → 重连
+      return
+    }
+    this.retry = 0
+    this.logger.info('subscribed ok')
+    this.emit('subscribed')
   }
 
   // ── 心跳 ───────────────────────────────────────────────
@@ -114,7 +145,8 @@ export class WsClient extends EventEmitter {
     clearInterval(this.hbTimer)
     this.hbTimer = setInterval(() => {
       if (this.ws?.readyState !== WebSocket.OPEN) return
-      this.send({ cmd: 'aibot_heartbeat', headers: { req_id: randomUUID() }, body: {} })
+      // 官方心跳帧：{ cmd: "ping", headers: { req_id } }（非 aibot_heartbeat）
+      this.send({ cmd: 'ping', headers: { req_id: buildReqId('ping') } })
       clearTimeout(this.pongTimer)
       this.pongTimer = setTimeout(() => {
         this.logger.warn('heartbeat timeout, force reconnect')
@@ -172,12 +204,15 @@ export class WsClient extends EventEmitter {
     })
   }
 
-  /** 欢迎语（⚠️ cmd 名以文档「发送欢迎语」一节为准） */
-  respondWelcome(reqId: string, markdown: string) {
+  /**
+   * 欢迎语回复。官方 aibot_respond_welcome_msg 仅支持 text（或模板卡片），
+   * 不支持 markdown —— content 按纯文本发送。事件回调后须在 5 秒内发出。
+   */
+  respondWelcome(reqId: string, content: string) {
     return this.send({
       cmd: 'aibot_respond_welcome_msg',
       headers: { req_id: reqId },
-      body: { msgtype: 'markdown', markdown: { content: markdown } },
+      body: { msgtype: 'text', text: { content } },
     })
   }
 
@@ -206,13 +241,13 @@ export class WsClient extends EventEmitter {
   }
 
   private sendStreamChunk(reqId: string, streamId: string, content: string, finish: boolean) {
+    // 官方流式回复格式：msgtype=stream，内容在 stream.content（非 markdown.content）
     return this.send({
       cmd: 'aibot_respond_msg',
       headers: { req_id: reqId },
       body: {
-        msgtype: 'markdown',
-        markdown: { content },
-        stream: { id: streamId, finish },
+        msgtype: 'stream',
+        stream: { id: streamId, finish, content },
       },
     })
   }

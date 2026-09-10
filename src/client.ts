@@ -87,7 +87,7 @@ function buildPanel(conn: any): { root: HTMLElement; refresh: () => void } {
   const botIdInput = el('input', { placeholder: '必填', style: FIELD_CSS }) as HTMLInputElement
   const secretInput = el('input', { type: 'password', placeholder: '留空则不修改', style: FIELD_CSS }) as HTMLInputElement
 
-  const presetInput = el('input', { placeholder: 'default', style: FIELD_CSS }) as HTMLInputElement
+  const presetInput = el('input', { placeholder: 'standard', style: FIELD_CSS }) as HTMLInputElement
   const sessionTtlInput = el('input', { type: 'number', placeholder: '1800000', min: '60000', style: FIELD_CSS }) as HTMLInputElement
   const welcomeTextInput = el('textarea', { placeholder: '用户进入会话时的欢迎语（支持 Markdown），留空使用默认文案', style: FIELD_CSS + 'min-height:60px;resize:vertical;' }) as HTMLTextAreaElement
 
