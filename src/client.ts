@@ -86,7 +86,7 @@ function buildPanel(conn: any): { root: HTMLElement; refresh: () => void } {
   /* 表单字段 */
   const botIdInput = el('input', { placeholder: '必填', style: FIELD_CSS }) as HTMLInputElement
   const secretInput = el('input', { type: 'password', placeholder: '留空则不修改', style: FIELD_CSS }) as HTMLInputElement
-  const allowFromInput = el('textarea', { placeholder: '每行一个 userid/chatid，留空则拒绝所有消息', style: FIELD_CSS + 'min-height:60px;resize:vertical;' }) as HTMLTextAreaElement
+
   const presetInput = el('input', { placeholder: 'default', style: FIELD_CSS }) as HTMLInputElement
   const sessionTtlInput = el('input', { type: 'number', placeholder: '1800000', min: '60000', style: FIELD_CSS }) as HTMLInputElement
   const welcomeTextInput = el('textarea', { placeholder: '用户进入会话时的欢迎语（支持 Markdown），留空使用默认文案', style: FIELD_CSS + 'min-height:60px;resize:vertical;' }) as HTMLTextAreaElement
@@ -104,7 +104,7 @@ function buildPanel(conn: any): { root: HTMLElement; refresh: () => void } {
   function getFormValues(): Record<string, unknown> {
     const patch: Record<string, unknown> = {
       botId: botIdInput.value.trim(),
-      allowFrom: allowFromInput.value.split('\n').map(s => s.trim()).filter(Boolean),
+
       preset: presetInput.value.trim() || 'default',
       replyMode: streamRadio.checked ? 'stream' : 'markdown',
       sessionTtlMs: parseInt(sessionTtlInput.value, 10) || 1800000,
@@ -122,7 +122,7 @@ function buildPanel(conn: any): { root: HTMLElement; refresh: () => void } {
     savedSecret = cfg.secret || ''
     secretInput.value = ''
     secretInput.placeholder = cfg.secret === '***' ? '已配置（输入新值覆盖）' : '必填'
-    allowFromInput.value = (cfg.allowFrom ?? []).join('\n')
+
     presetInput.value = cfg.preset || ''
     if (cfg.replyMode === 'markdown') markdownRadio.checked = true; else streamRadio.checked = true
     sessionTtlInput.value = String(cfg.sessionTtlMs ?? 1800000)
@@ -190,10 +190,6 @@ function buildPanel(conn: any): { root: HTMLElement; refresh: () => void } {
     el('span', { style: HINT_CSS, textContent: '仅创建时显示一次，丢失需重新生成。保持为空则不修改当前密钥。' }),
     secretInput,
 
-    /* allowFrom */
-    el('label', { style: LABEL_CSS, textContent: '白名单' }),
-    el('span', { style: HINT_CSS, textContent: '每行一个 userid/chatid，留空则拒绝所有消息' }),
-    allowFromInput,
 
     /* preset */
     el('label', { style: LABEL_CSS, textContent: 'Preset' }),

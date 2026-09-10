@@ -132,9 +132,10 @@ export class SessionBridge {
     const reqId = pkt.headers.req_id
     const body = pkt.body
 
-    // 1. 白名单（空 = 拒绝所有）
+    // 1. 白名单（空或 ["*"] = 允许所有）
     const key = body.chattype === 'group' ? body.chatid : body.from.userid
-    if (!this.cfg.allowFrom.length || !this.cfg.allowFrom.includes(key)) {
+    const allowFrom: string[] = this.cfg.allowFrom ?? []
+    if (allowFrom.length && !allowFrom.includes('*') && !allowFrom.includes(key)) {
       ws.respondMarkdown(reqId, '⛔ 您不在允许名单中，请联系管理员')
       return
     }

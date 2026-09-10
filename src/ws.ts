@@ -94,10 +94,12 @@ export class WsClient extends EventEmitter {
         break
 
       case 'aibot_msg_callback':
+        this.logger.debug('msg received: msgtype=%s msgid=%s', pkt.body?.msgtype, pkt.body?.msgid)
         this.emit('message', pkt)
         break
 
       case 'aibot_event_callback':       // 进入会话/点赞点踩等事件
+        this.logger.debug('event received: event_type=%s', pkt.body?.event_type)
         this.emit('event', pkt)
         break
 
