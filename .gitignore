@@ -8,3 +8,4 @@ lib/
 .soloncode/
 .workbuddy/
 .agents
+.merkle-snapshot.json

@@ -1,0 +1,5 @@
+# 插件注册为 profile 层 entry。
+# 配置请到 DSH 控制台 → 插件配置 → wecom 中填写（settings 持久化）。
+- insert:
+    - id: wecom
+      name: dsh-plugin-wecom
