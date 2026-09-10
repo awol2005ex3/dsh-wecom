@@ -15,8 +15,14 @@ DeepSeek Harness（dsh）企业微信智能机器人插件。通过企微"智能
 
 ### 回复模式
 
-- **markdown**：Agent 回合结束后一次性回复，内容为最后一条助理消息。
+- **markdown**：过程中不刷新，Agent 回合结束后一次性给出最终内容。
 - **stream**：逐 token 推送到企微流式打字机（内置 500ms 推送节流）。
+
+> ⚠ **两种模式都先发一帧流式占位（"思考中…"）**：企微要求「收到消息回调后 5 秒内回复」，
+> 而 Agent 首个 token 通常远晚于此，不占位则 req_id 超时失效、后续所有帧被丢弃
+> （用户侧一直停在 "…"）。占位帧与后续刷新共用同一个 `stream.id`，最终被 `finish=true`
+> 的全量内容**原位替换**，聊天记录里只留一条消息。
+> 从首帧起 10 分钟内必须 `finish=true`，插件在 5 分钟时主动收尾。
 
 ## 安装
 
@@ -127,14 +133,27 @@ session store 的 id 在同一进程内唯一，`sessions.prepare()` 撞上同�
 上一轮 bridge 的 agent 还没释放完（`AgentHandle.dispose()` 是异步的）就建了新 bridge
 （配置热更新 / 插件重载），或进程内已存在该会话的 agent。
 
-插件已按以下顺序自愈，无需手工干预：
+插件按以下顺序自愈，不会再把这个错误抛给用户：
 
 1. 本 bridge 已缓存 → 直接复用；
 2. `ctx.agents.get(sid)` 有存活 agent → **借用**（不重复 create，也不在释放时销毁它）；
-3. `create` 仍报冲突 → 再查一次 agent；查无 agent 但会话残留 → 用 `原id#时间戳` 开新会话并告警；
-4. 服务重启走串行 promise 链，先 `await` 旧 bridge 的 `dispose()` 再建新实例。
+3. `create` 报冲突 → 再借一次（并发刚落地）；
+4. 仍冲突 → **同 id 重试一次**（瞬时竞争，事务回滚后 store 已空）；
+5. 仍失败 → 用 `原id#时间戳` 开新会话并告警（SessionStore 没有公开删除接口，残留会话只能绕开）；
+6. 服务重启走串行 promise 链，先 `await` 旧 bridge 的 `dispose()` 再建新实例。
 
-日志关键词：`adopt live agent for ...`（走了借用分支）、`session ... 残留且无 agent`（走了新会话分支）。
+### 企微侧一直是 "…" 没有回复
+
+先看 Web 控制台（`:3080`）里该会话有没有产出——有产出说明 Agent 正常，问题在回复时序：
+企微要求**收到回调后 5 秒内**回一帧，本插件在 `process()` 一开始就发流式占位帧来满足它，
+所有出口（成功 / 失败 / 超时）统一用 `finish=true` 收尾。
+若仍无回复，查 host 日志里的 `raw frame:` 行——企微对失效/错误帧会回带 `errcode`。
+
+日志关键词：
+
+- `adopt live agent for ...` —— 走了借用分支；
+- `create session ... 冲突（...）；诊断: agent=... session=... sessions服务=... 存活会话=N` —— 走了自愈分支，括号里是定位信息；
+- `... 仍冲突（...），改用新会话 ...` —— 最终兜底，会话上下文会重置。
 
 ## License
 

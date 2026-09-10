@@ -38,7 +38,7 @@ const SID = 'wecom:single:user-1'
   assert.equal(agents.get(SID), live, 'bridge 释放后借用的 agent 仍在')
 }
 
-// 2. 会话残留但无 agent → 换新 id
+// 2. 会话残留但无 agent → 同 id 重试一次后换新 id
 {
   const created = []
   const agents = {
@@ -49,25 +49,42 @@ const SID = 'wecom:single:user-1'
       return { agent: { session: { id: opts.sessionId } }, dispose: async () => {} }
     },
   }
-  const sessions = { get: (id) => (id === SID ? { id } : undefined) }
+  const sessions = { get: (id) => (id === SID ? { id } : undefined), list: () => [{ id: SID }] }
   const bridge = new SessionBridge(makeCtx({ agents, sessions }), { preset: 'standard' })
   const handle = await bridge.ensureAgent(SID)
-  assert.equal(created.length, 2, '应重试一次')
+  assert.deepEqual(created, [SID, SID, `${handle.agent.session.id}`], '应同 id 重试一次再换新 id')
   assert.ok(handle.agent.session.id.startsWith(`${SID}#`), `新会话 id 应带后缀：${handle.agent.session.id}`)
   await bridge.dispose()
 }
 
-// 3. 无会话可查 → 抛错
+// 3. 查不到会话也查不到 agent（诊断信息全空）→ 仍然要换新 id 兜底，不能抛
+{
+  const created = []
+  const agents = {
+    get: () => undefined,
+    create: async (opts) => {
+      created.push(opts.sessionId)
+      if (opts.sessionId === SID) throw new Error(`session "${SID}" already exists`)
+      return { agent: { session: { id: opts.sessionId } }, dispose: async () => {} }
+    },
+  }
+  const bridge = new SessionBridge(makeCtx({ agents, sessions: undefined }), { preset: 'standard' })
+  const handle = await bridge.ensureAgent(SID)
+  assert.ok(handle.agent.session.id.startsWith(`${SID}#`), `无诊断信息时也要兜底：${handle.agent.session.id}`)
+  await bridge.dispose()
+}
+
+// 4. 非冲突错误必须原样抛出，不能被吞
 {
   const agents = {
     get: () => undefined,
-    create: async () => { throw new Error(`session "${SID}" already exists`) },
+    create: async () => { throw new Error('boom') },
   }
-  const bridge = new SessionBridge(makeCtx({ agents, sessions: { get: () => undefined } }), { preset: 'standard' })
-  await assert.rejects(() => bridge.ensureAgent(SID), /无法恢复/)
+  const bridge = new SessionBridge(makeCtx({ agents, sessions: undefined }), { preset: 'standard' })
+  await assert.rejects(() => bridge.ensureAgent(SID), /boom/)
 }
 
-// 4. 正常创建 → 拥有所有权，dispose 会释放
+// 5. 正常创建 → 拥有所有权，dispose 会释放
 {
   let disposed = 0
   const agents = {

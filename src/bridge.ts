@@ -14,8 +14,14 @@ import { LRUCache } from './lru.js'
 import { SessionQueue } from './queue.js'
 import { MediaHandler } from './media.js'
 
-/** 单个 agent 回合等待的兜底超时（防止会话队列卡死）。 */
-const TURN_TIMEOUT_MS = 10 * 60_000
+/**
+ * 单个 agent 回合等待的兜底超时。
+ * 企微从流式首帧起 10 分钟后强制结束消息，这里取一半作为安全余量。
+ */
+const TURN_TIMEOUT_MS = 5 * 60_000
+
+/** `WsClient.createStreamResponder()` 的返回类型。 */
+export type StreamResponder = ReturnType<WsClient['createStreamResponder']>
 
 interface WecomAgentEntry {
   handle: AgentHandle
@@ -28,6 +34,10 @@ function isAlreadyExists(err: unknown): boolean {
   if (!(err instanceof Error)) return false
   const message = err.message.toLowerCase()
   return message.includes('already exists') || message.includes('already attached')
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
 }
 
 /** 提取 assistant 消息中的全部文本块。 */
@@ -117,7 +127,7 @@ export class SessionBridge {
     const sid = brandString<SessionId>(sessionId)
 
     // 1. 进程内已有存活 agent → 借用（handle 归创建者所有，这里只用于 followup）
-    const live = ctx.agents.get(sid) as Agent | undefined
+    const live = this.liveAgent(sid)
     if (live) return this.adopt(sessionId, live, 'live agent')
 
     const preset = await ctx.agentPresets.resolve(this.cfg.preset)
@@ -134,28 +144,60 @@ export class SessionBridge {
     })
 
     // 2. 正常创建
+    let conflict: unknown
     try {
       const handle = await create(sid)
       this.agents.set(sessionId, { handle, owned: true })
       return handle
     } catch (err) {
       if (!isAlreadyExists(err)) throw err
+      conflict = err
     }
 
-    // 3. 撞车：可能是并发创建刚落地，也可能是没有 agent 的残留会话
-    const raced = ctx.agents.get(sid) as Agent | undefined
+    // 3. 撞车自愈：先再借一次（并发创建刚落地），再同 id 重试（瞬时竞争），
+    //    最后才换新 id —— 宁可丢上下文，也不能让用户收不到回复。
+    const raced = this.liveAgent(sid)
     if (raced) return this.adopt(sessionId, raced, 'raced agent')
 
-    const stale = (ctx.get('sessions') as { get(id: SessionId): unknown } | undefined)?.get(sid)
-    if (stale) {
-      // 会话还活着但没有 agent，无法接管，只能用新 id 开一轮，避免用户被卡死
-      const freshId = brandString<SessionId>(`${sessionId}#${Date.now()}`)
-      this.logger().warn('wecom: session %s 残留且无 agent，改用新会话 %s', sessionId, freshId)
-      const handle = await create(freshId)
+    this.logger().warn(
+      'wecom: create session %s 冲突（%s）；诊断: agent=%s session=%s sessions服务=%s 存活会话=%d',
+      sessionId, errorMessage(conflict),
+      this.liveAgent(sid) !== undefined, this.liveSession(sid) !== undefined,
+      ctx.get('sessions') !== undefined, this.liveSessionCount(),
+    )
+
+    try {
+      const handle = await create(sid)
       this.agents.set(sessionId, { handle, owned: true })
       return handle
+    } catch (err) {
+      if (!isAlreadyExists(err)) throw err
+      conflict = err
     }
-    throw new Error(`session "${sessionId}" 冲突且无法恢复`)
+
+    const freshId = brandString<SessionId>(`${sessionId}#${Date.now()}`)
+    this.logger().warn('wecom: %s 仍冲突（%s），改用新会话 %s', sessionId, errorMessage(conflict), freshId)
+    const handle = await create(freshId)
+    this.agents.set(sessionId, { handle, owned: true })
+    return handle
+  }
+
+  /** 进程内是否已有该 id 的存活 agent。 */
+  private liveAgent(sid: SessionId): Agent | undefined {
+    return (this.ctx as any).agents.get(sid) as Agent | undefined
+  }
+
+  /** 进程内是否已有该 id 的存活会话（拿不到 sessions 服务时为 undefined）。 */
+  private liveSession(sid: SessionId): unknown {
+    const store = (this.ctx as any).get('sessions') as
+      { get(id: SessionId): unknown; list?(): ReadonlyArray<{ id: unknown }> } | undefined
+    if (!store) return undefined
+    return store.get(sid) ?? store.list?.().find((session) => session.id === sid)
+  }
+
+  private liveSessionCount(): number {
+    const store = (this.ctx as any).get('sessions') as { list?(): unknown[] } | undefined
+    return store?.list?.().length ?? -1
   }
 
   /** 借用非本 bridge 创建的 agent：只用于发消息，不在 dispose 时释放。 */
@@ -185,6 +227,11 @@ export class SessionBridge {
     const reqId = pkt.headers.req_id
     const body = pkt.body
 
+    // 0. 立刻开一条流式消息占位：企微要求回调后 5 秒内回一帧，
+    //    否则 req_id 失效、后续所有回复帧都会被丢弃（用户侧一直停在 "…"）。
+    //    之后所有出口（成功/失败/超时）都用 finish 收尾，占位内容会被原位替换。
+    const responder = ws.createStreamResponder(reqId)
+
     // 1. 构造 Agent 输入
     let content: string
     switch (body.msgtype) {
@@ -198,45 +245,46 @@ export class SessionBridge {
         const extMap = { image: '.png', file: '.bin', voice: '.amr' } as const
         const msgType = body.msgtype as keyof typeof extMap
         const mediaId = body[msgType]?.media_id
-        if (!mediaId) { ws.respondMarkdown(reqId, '收到媒体但缺少 media_id'); return }
+        if (!mediaId) { responder.finish('收到媒体但缺少 media_id'); return }
         try {
           const localPath = await this.media.download(mediaId, extMap[msgType])
           content = `[用户上传了${body.msgtype}] 文件路径: ${localPath}\n请根据文件内容回复用户。`
         } catch (e: any) {
-          ws.respondMarkdown(reqId, `媒体下载失败：${e.message}`)
+          responder.finish(`媒体下载失败：${e.message}`)
           return
         }
         break
       }
 
       default:
-        ws.respondMarkdown(reqId, '暂不支持该消息类型')
+        responder.finish('暂不支持该消息类型')
         return
     }
 
     // 3. 调用 Agent：先注册事件监听再入队消息，避免丢失 turn 事件
     try {
       const handle = await this.ensureAgent(sessionId)
-      const turn = this.runTurn(handle, ws, reqId)
+      const turn = this.runTurn(handle, responder)
       handle.agent.followup(createUserMessage({
         content: [{ type: 'text', text: content }],
         source: { kind: 'plugin', plugin: 'wecom' },
       }))
       await turn
     } catch (err: any) {
-      ws.respondMarkdown(reqId, `处理失败：${errorChain(err)}`)
+      responder.finish(`处理失败：${errorChain(err)}`)
     }
   }
 
   /**
-   * 等待一次 followup 对应的 agent 回合结束，并把输出转发给企微：
-   * - stream 模式：逐 token（text-delta）累积推流，turn/end 时 finish
-   * - markdown 模式：取该回合最后一条 assistant 消息一次性回复
+   * 等待一次 followup 对应的 agent 回合结束，并把输出转发给企微。
+   *
+   * 占位流已在 process() 里开好，这里只负责刷新与收尾：
+   * - stream 模式：逐 token（text-delta）累积推流，turn/end 时 finish 全量内容
+   * - markdown 模式：过程中不刷新，turn/end 时把最后一条 assistant 消息一次性 finish
    */
-  private runTurn(handle: AgentHandle, ws: WsClient, reqId: string): Promise<void> {
+  private runTurn(handle: AgentHandle, responder: StreamResponder): Promise<void> {
     const sid = handle.agent.session.id
     const streamMode = this.cfg.replyMode === 'stream'
-    const responder = streamMode ? ws.createStreamResponder(reqId) : null
     const texts: string[] = []
 
     return new Promise<void>((resolve, reject) => {
@@ -258,10 +306,11 @@ export class SessionBridge {
         }
         if (targetTurn === null) return
 
-        if (event.type === 'assistant/chunk'
+        if (streamMode
+          && event.type === 'assistant/chunk'
           && event.data.turn === targetTurn
           && event.data.chunk.type === 'text-delta') {
-          responder?.append(event.data.chunk.text)
+          responder.append(event.data.chunk.text)
           return
         }
         if (event.type === 'assistant/message' && event.data.turn === targetTurn) {
@@ -271,39 +320,23 @@ export class SessionBridge {
         }
         if (event.type === 'turn/end' && event.data.turn === targetTurn) {
           const reason = event.data.reason
+          cleanup()
           if (reason.kind === 'error') {
-            cleanup()
-            if (streamMode && responder) {
-              if (responder.pushed) {
-                responder.finish()
-              } else {
-                ws.respondMarkdown(reqId, `处理失败：${reason.error?.message ?? 'agent turn failed'}`)
-              }
-              resolve()
-            } else {
-              reject(new Error(reason.error?.message ?? 'agent turn failed'))
-            }
-            return
-          }
-          if (streamMode) {
-            responder?.finish()
-            cleanup()
+            // 占位帧已经发过，必须用 finish 收尾（错误文案替换占位），
+            // 不能再走一次性 markdown —— 那时 req_id 早已超过 5 秒窗口。
+            responder.finish(`处理失败：${reason.error?.message ?? 'agent turn failed'}`)
             resolve()
             return
           }
-          const full = texts.length ? texts[texts.length - 1] : ''
-          ws.respondMarkdown(reqId, full || '（本次没有生成回复内容）')
-          cleanup()
+          // 不给兜底文案：没拿到 assistant/message 时由 ws 层回退到累积的流式内容
+          responder.finish(texts.length ? texts[texts.length - 1] : '')
           resolve()
         }
       })
 
       const timer = setTimeout(() => {
-        if (streamMode) {
-          responder?.finish()
-        } else {
-          ws.respondMarkdown(reqId, '处理超时，请稍后再试')
-        }
+        // 首帧起 10 分钟企微会强制结束流式消息，这里留一半余量主动收尾
+        responder.finish('处理超时，请稍后再试')
         cleanup()
         resolve()
       }, TURN_TIMEOUT_MS)

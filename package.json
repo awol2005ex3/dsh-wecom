@@ -26,7 +26,8 @@
     "typecheck": "tsc --noEmit",
     "check:rpc": "npm run build && node scripts/check-rpc.mjs",
     "check:agent": "npm run build && node scripts/check-ensure-agent.mjs",
-    "check": "npm run build && node scripts/check-rpc.mjs && node scripts/check-ensure-agent.mjs"
+    "check:reply": "npm run build && node scripts/check-reply.mjs",
+    "check": "npm run build && node scripts/check-rpc.mjs && node scripts/check-ensure-agent.mjs && node scripts/check-reply.mjs"
   },
   "dsh": {
     "bundle": {

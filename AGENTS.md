@@ -32,6 +32,9 @@ npm install                     # 安装依赖（ws / cordis / schemastery 等�
 npm run build                   # tsc -p tsconfig.json
 npm run typecheck               # tsc --noEmit
 npm run check:rpc               # 构建 + 用假 connection 驱动宿主 RPC（信封/错误/反注册）
+npm run check:agent             # 构建 + 假 ctx 驱动 ensureAgent 的会话冲突分支
+npm run check:reply             # 构建 + 假 ws 驱动完整消息链路（占位帧/收尾/错误分支）
+npm run check                   # 以上三个全跑
 npx @deepseek-ai/dsh plugin --profile web add .   # 链接进 web profile
 ```
 
@@ -65,9 +68,12 @@ npx @deepseek-ai/dsh plugin --profile web add .   # 链接进 web profile
 
 10. **RPC 错误信封必须带齐 `code` / `message` / `details`。** 浏览器 `parseConnectionResponse` 三者缺一即抛 `invalid server-response failure`。业务拒绝用 `code: 'gateway/bad-request'`，**不要用 `internal`**（部分客户端会触发重试），HTTP 状态恒为 200。
 
-11. **会话 id 冲突（`session "<id>" already exists`）的两条纪律。** `sessions.prepare()` / `enter()` 发现同名会话直接抛错，而 `AgentHandle.dispose()` 是**异步**的（要把会话从 store 移除）：
+11. **企微回复必须先占位、后收尾（5 秒规则）。** 企微要求「收到 `aibot_msg_callback` 后 5 秒内回复」，否则 req_id 失效、后续帧全被丢弃（用户侧永远停在 "…"）。因此 `process()` 一进来就 `ws.createStreamResponder(reqId)`（该方法**创建即发首帧占位**），之后所有出口——媒体失败、不支持类型、turn/end 成功、turn 出错、超时——统一用 `responder.finish(...)`，且 `finish` 的内容优先级是「显式文案 > 累积 buf > 兜底」。**任何分支都不要再退回 `respondMarkdown()`**（那时早已超窗口）。另外首帧起 10 分钟企微强制结束流式消息，`TURN_TIMEOUT_MS` 取 5 分钟留余量。
+
+12. **会话 id 冲突（`session "<id>" already exists`）的两条纪律。** `sessions.prepare()` / `enter()` 发现同名会话直接抛错，而 `AgentHandle.dispose()` 是**异步**的（要把会话从 store 移除）：
     - 重启服务（配置热更新）前**必须 `await` 旧 `SessionBridge.dispose()`**，否则新 bridge 会撞上尚未释放的同名会话；`startServices` 已用一个 promise 链串行化启停。
-    - `ensureAgent` 先 `ctx.agents.get(sid)`：进程内已有存活 agent 就**借用**（包一个 `dispose` 为空的伪 handle，不在本 bridge 释放），借不到再 `create`；`create` 撞车时再查一次，仍无 agent 且会话残留则用 `${sessionId}#${Date.now()}` 开新会话。
+    - `ensureAgent` 的五级自愈：缓存 → `ctx.agents.get(sid)` **借用**（包 `dispose` 为空的伪 handle，标 `owned:false` 不释放）→ `create` → 撞车后**再借一次** → **同 id 重试一次**（瞬时竞争）→ 仍失败则用 `${sessionId}#${Date.now()}` 开新会话。任何一步都不要抛给用户在企微里看到「处理失败」。
+    - 定位手段：冲突时会打 `wecom: create session <id> 冲突（...）；诊断: agent=... session=... sessions服务=... 存活会话=N`。`sessions服务=false` 说明当前 ctx 拿不到 session store（隔离 scope 问题）；`session=true` 说明会话残留且无 agent。SessionStore **没有公开删除接口**（`detachEntered` 是私有的），残留会话只能绕开、不能清理。
 
 ---
 

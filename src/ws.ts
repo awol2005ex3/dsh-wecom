@@ -9,6 +9,10 @@ const HEARTBEAT_INTERVAL_MS = 30_000   // 官方文档「保持心跳」：建�
 const HEARTBEAT_TIMEOUT_MS  = 10_000
 const MAX_BACKOFF_MS        = 60_000
 const STREAM_THROTTLE_MS    = 500      // 流式推送节流
+/** 首帧占位文案：满足「收到回调后 5 秒内必须回复」，最终会被 finish 的全量内容原位替换。 */
+const STREAM_PLACEHOLDER    = '思考中…'
+/** 流式消息既没累积内容也没给终结文案时的兜底。 */
+const EMPTY_REPLY           = '（本次没有生成回复内容）'
 
 /**
  * req_id 生成：带命令前缀。无 cmd 的服务端回执（订阅响应/心跳响应）
@@ -16,6 +20,13 @@ const STREAM_THROTTLE_MS    = 500      // 流式推送节流
  */
 function buildReqId(prefix: string): string {
   return `${prefix}_${Date.now()}_${randomUUID().replace(/-/g, '').slice(0, 8)}`
+}
+
+/** 终结内容取舍：显式文案 > 累积内容 > 兜底文案。 */
+export function pickFinal(buf: string, finalText: string | undefined): string {
+  if (finalText !== undefined && finalText.trim() !== '') return finalText
+  if (buf.trim() !== '') return buf
+  return EMPTY_REPLY
 }
 
 export interface WecomConfig {
@@ -216,12 +227,26 @@ export class WsClient extends EventEmitter {
     })
   }
 
-  /** 流式回复句柄：content 全量累积，finish 结束，内置节流 */
-  createStreamResponder(reqId: string) {
+  /**
+   * 流式回复句柄：**创建即发出首帧占位**。
+   *
+   * 企微要求「收到消息回调后 5 秒内回复」，而 Agent 首个 token 通常远晚于此，
+   * 不先占位的话 req_id 会超时失效，后续所有帧都被丢弃（用户侧一直停在 "…"）。
+   * 占位帧用同 stream.id，后续 finish 的全量内容会把它原位替换掉。
+   *
+   * 从首帧开始 10 分钟内必须 finish=true，否则企微自动结束消息。
+   */
+  createStreamResponder(reqId: string, placeholder = STREAM_PLACEHOLDER) {
     const streamId = randomUUID()
     let buf = ''
     let lastPush = 0
     let pushed = false
+    if (this.sendStreamChunk(reqId, streamId, placeholder, false)) {
+      pushed = true
+      lastPush = Date.now()
+    } else {
+      this.logger.warn('stream placeholder not sent for req_id=%s', reqId)
+    }
     return {
       append: (delta: string) => {
         buf += delta
@@ -232,7 +257,12 @@ export class WsClient extends EventEmitter {
           this.sendStreamChunk(reqId, streamId, buf, false)
         }
       },
-      finish: () => this.sendStreamChunk(reqId, streamId, buf, true),
+      /**
+       * 结束流式：content 为全量内容。
+       * 显式给了 finalText 就用它（回合结果 / 错误文案 / 超时提示优先），
+       * 否则退回累积的 buf，都为空时给一句兜底文案。
+       */
+      finish: (finalText?: string) => this.sendStreamChunk(reqId, streamId, pickFinal(buf, finalText), true),
       /** 是否已推送过流式内容（用于错误收尾判断）。 */
       get pushed(): boolean {
         return pushed
