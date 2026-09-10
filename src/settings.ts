@@ -3,7 +3,6 @@ import z from '@deepseek-ai/schemastery'
 export interface WecomSettings {
   botId: string
   secret: string
-  allowFrom: string[]
   preset: string
   replyMode: 'markdown' | 'stream'
   sessionTtlMs: number
@@ -16,9 +15,6 @@ export const WecomSettingsSchema: z<WecomSettings> = z.object({
   ),
   secret: z.string().role('secret').default('').description(
     'Bot Secret（仅创建时显示一次，丢失需重新生成）',
-  ),
-  allowFrom: z.array(z.string()).default([]).description(
-    '允许的 userid/chatid 白名单，留空或 ["*"] 则表示允许所有',
   ),
   preset: z.string().default('standard').description(
     'Agent 使用的 dsh preset 名称（standard / ptc / minimal / cordis）',

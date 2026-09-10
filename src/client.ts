@@ -4,14 +4,17 @@
  * 构建契约同 dsh-role-manager/src/client.ts：
  * 本文件经 tsc 编译后，由 scripts/wrap-client.mjs 包上闭包工厂外壳。
  *
- * 功能：通过 ctx.connection.rpc 调用宿主端 /rpc 端点，提供
- * wecom 插件的配置面板（botId/secret/allowFrom/preset/replyMode 等）。
+ * 功能：通过 ctx.connection.rpc 调用宿主端 /api/wecom-rpc/* 端点，提供
+ * wecom 插件的配置面板（botId/secret/preset/replyMode 等）。
  * 启动器挂入侧边栏 [data-slot="sidebar.footer.action"] 插槽，缺失时回退为浮动按钮。
+ *
+ * ⚠ 通道固定为 /api：宿主端是 connection.fetch.register() 注册的 exact 路由
+ * （0.1.5 起 rpc.handle 对插件失效），只有 /api 前缀才会被路由表命中。
  */
 
 const PLUGIN_ID = 'dsh-plugin-wecom'
-const RPC_CHANNEL = '/wecom-rpc'
-const RPC_PREFIX = 'wecom/'
+const RPC_CHANNEL = '/api'
+const RPC_PREFIX = 'wecom-rpc/'
 
 declare const module: { exports: unknown }
 
@@ -45,7 +48,8 @@ function el<K extends keyof HTMLElementTagNameMap>(
 interface RpcResponse {
   ok: boolean
   value?: unknown
-  error?: { message: string }
+  /** 0.1.5 起宿主必须回 code / message / details，否则浏览器校验信封失败。 */
+  error?: { code: string; message: string; details?: unknown }
 }
 
 async function callRpc(conn: any, endpoint: string, args?: Record<string, unknown>): Promise<unknown> {
@@ -72,7 +76,6 @@ const HINT_CSS = 'display:block;font-size:11px;color:#57606a;margin-bottom:4px;'
 interface WecomConfig {
   botId: string
   secret: string
-  allowFrom: string[]
   preset: string
   replyMode: 'markdown' | 'stream'
   sessionTtlMs: number

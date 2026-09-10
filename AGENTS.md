@@ -16,6 +16,10 @@
 | `src/queue.ts` | `SessionQueue` — 同 sessionId 消息严格串行，不同会话并发不阻塞。 |
 | `src/media.ts` | `MediaHandler` — 使用 Node 原生 `fetch` 下载企微媒体资源到沙箱，使用 `openAsBlob` + `FormData` 上传临时素材。**无第三方 form-data 依赖**。 |
 | `src/bridge.ts` | `SessionBridge` — 消息分发、白名单、幂等去重、会话队列、Agent 创建与事件驱动回复协调。核心桥接层。 |
+| `src/settings.ts` | `WecomSettings` + `WecomSettingsSchema`（schemastery），由 `ctx.settings.register('wecom', ..., { applies: 'live' })` 注册，改配置即热重启服务。 |
+| `src/rpc.ts` | **宿主半 RPC**：`registerRpcHandler()` 用 `connection.fetch.register()` 挂 `/api/wecom-rpc/{get,update}`，供浏览器配置面板读写设置。 |
+| `src/client.ts` | **浏览器半**（经 `scripts/wrap-client.mjs` 包成 CJS 闭包工厂）。侧边栏入口「⚙ 企微」→ 配置面板。 |
+| `src/debuglog.ts` | `debugLog` / `tee` — 受 `DSH_WECOM_DEBUG` 控制的落盘诊断日志。 |
 | `lib/` | tsc 构建产物（.js + .d.ts），`package.json` 的 `files` 仅包含 `lib`。 |
 | `docs/dsh-plugin-wecom-完整方案.md` | 方案设计文档（M1–M5 分阶段验证清单、协议要点、待核对字段）。 |
 
@@ -27,6 +31,7 @@
 npm install                     # 安装依赖（ws / cordis / schemastery 等）
 npm run build                   # tsc -p tsconfig.json
 npm run typecheck               # tsc --noEmit
+npm run check:rpc               # 构建 + 用假 connection 驱动宿主 RPC（信封/错误/反注册）
 npx @deepseek-ai/dsh plugin --profile web add .   # 链接进 web profile
 ```
 
@@ -56,6 +61,14 @@ npx @deepseek-ai/dsh plugin --profile web add .   # 链接进 web profile
 
 8. **`Config` 不应在代码中硬编码 secret / botId。** 配置只写在 Schema 里，通过控制台表单编辑，日志严禁打印 secret。
 
+9. **插件 RPC 只能用 `connection.fetch.register()`，禁用 `connection.rpc.handle()`。** harness 0.1.5 起 `rpc.handle` 内部执行 `owner.webServer.register(route)`，而 connection 插件的 fiber 只 inject 了 `credentials`（`/api` 改由 `ctx.inject(['webServer'])` 延迟挂载），cordis 4 严格属性访问抛 `cannot get property "webServer" without inject`，错误被 catch 吞掉 → 浏览器只看到 `HTTP 405`。正解是注册 `/api/<route>` 的 **exact Fetch 路由**（在 `/api` prefix 之前命中，仍经过信任栅栏与浏览器鉴权），浏览器侧固定 `connection.rpc.call('/api', ...)`。
+
+10. **RPC 错误信封必须带齐 `code` / `message` / `details`。** 浏览器 `parseConnectionResponse` 三者缺一即抛 `invalid server-response failure`。业务拒绝用 `code: 'gateway/bad-request'`，**不要用 `internal`**（部分客户端会触发重试），HTTP 状态恒为 200。
+
+11. **会话 id 冲突（`session "<id>" already exists`）的两条纪律。** `sessions.prepare()` / `enter()` 发现同名会话直接抛错，而 `AgentHandle.dispose()` 是**异步**的（要把会话从 store 移除）：
+    - 重启服务（配置热更新）前**必须 `await` 旧 `SessionBridge.dispose()`**，否则新 bridge 会撞上尚未释放的同名会话；`startServices` 已用一个 promise 链串行化启停。
+    - `ensureAgent` 先 `ctx.agents.get(sid)`：进程内已有存活 agent 就**借用**（包一个 `dispose` 为空的伪 handle，不在本 bridge 释放），借不到再 `create`；`create` 撞车时再查一次，仍无 agent 且会话残留则用 `${sessionId}#${Date.now()}` 开新会话。
+
 ---
 
 ## API 契约速查
@@ -63,7 +76,7 @@ npx @deepseek-ai/dsh plugin --profile web add .   # 链接进 web profile
 ### 插件注入的服务
 
 ```ts
-export const inject = ['agents', 'agentPresets', 'agentDefaultModel', 'sandboxPolicy'] as const
+export const inject = ['agents', 'agentPresets', 'agentDefaultModel', 'sandboxPolicy', 'connection', 'settings'] as const
 ```
 
 - `agents`（`ctx.agents`）：`create(options)` / `resume(options)` → `Promise<AgentHandle>`
@@ -71,6 +84,8 @@ export const inject = ['agents', 'agentPresets', 'agentDefaultModel', 'sandboxPo
 - `agentDefaultModel`（`ctx.agentDefaultModel`，类型容缺）：`currentSelection()` → `{ provider, model }`
 - `sandboxPolicy`（`ctx.sandboxPolicy`，类型容缺）：`resolve({ session?, mode? }).workspaceRoot` → 沙箱工作目录
 - `logger`（cordis 内置，**不注入**）：`ctx.logger('wecom')` → 带 scope 的 Logger
+- `settings`（`ctx.settings`）：`register(name, schema, { applies })` → `SettingsScope`（`get()` / `update(patch)` / `watch(cb)`）
+- `connection`（`ctx.get('connection')`）：只用到 `fetch.register(route)`，见约定 9
 
 ### Agent 创建与回合驱动
 
@@ -203,13 +218,12 @@ const mediaId = await media.upload(filePath, 'image' | 'file')
 
 8. **`Application` vs `Context`**：`apply()` 的参数是 `ctx: Context`（来自 cordis），不是 application 或其他对象。`ctx.logger` 是 callable。
 
-9. **`allowFrom` 数组默认值**：控制台新建配置可能传 `undefined`，方案中曾用 `.transform()` 兜底。schemastery 的 `.default([])` 已覆盖此场景，无需额外 transform。
 
-10. **`@deepseek-ai/dsh-agent-default-model` 不存在**：`inject` 中已声明 `agentDefaultModel`（服务运行时确实存在），但 npm 上无此类型定义包。用 `(ctx as any).agentDefaultModel?.currentSelection?.()` 编译时容缺。
+9. **`@deepseek-ai/dsh-agent-default-model` 不存在**：`inject` 中已声明 `agentDefaultModel`（服务运行时确实存在），但 npm 上无此类型定义包。用 `(ctx as any).agentDefaultModel?.currentSelection?.()` 编译时容缺。
 
-11. **`logger` 不能放进 `inject`**：报 `dsh-plugin-wecom: pending (waiting for service: logger)`，整个 profile 启动失败（`1 entry did not activate`）。`logger` 是 cordis 内置属性而非 service provider，直接 `ctx.logger('wecom')`。
+10. **`logger` 不能放进 `inject`**：报 `dsh-plugin-wecom: pending (waiting for service: logger)`，整个 profile 启动失败（`1 entry did not activate`）。`logger` 是 cordis 内置属性而非 service provider，直接 `ctx.logger('wecom')`。
 
-12. **Schema 必填字段未配置会拖垮整个 profile**：`botId`/`secret` 加 `.required()` 后，未配置时 loader 报 `invalid config: $.botId missing required value`，`dsh web` 起不来。对策：bundle patch 的 insert 提供空串占位 `config: { botId: '', secret: '' }`（schemastery required 只拒绝 undefined，空串通过），`apply()` 开头检测 `!config.botId || !config.secret` 则打印警告并 `return`（不启动 ws），用户到控制台填真值后保存即热重载接入。
+11. **Schema 必填字段未配置会拖垮整个 profile**：`botId`/`secret` 加 `.required()` 后，未配置时 loader 报 `invalid config: $.botId missing required value`，`dsh web` 起不来。对策：bundle patch 的 insert 提供空串占位 `config: { botId: '', secret: '' }`（schemastery required 只拒绝 undefined，空串通过），`apply()` 开头检测 `!config.botId || !config.secret` 则打印警告并 `return`（不启动 ws），用户到控制台填真值后保存即热重载接入。
 
 ---
 

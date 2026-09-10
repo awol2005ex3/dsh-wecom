@@ -143,7 +143,6 @@ export const name = 'wecom'
 export interface Config {
   botId: string
   secret: string
-  allowFrom: string[]
   preset: string
   replyMode: 'markdown' | 'stream'
   sessionTtlMs: number
@@ -160,10 +159,6 @@ export const Config: Schema<Config> = Schema.object({
     .required()
     .description('Bot Secret（仅创建时显示一次，丢失需重新生成）'),
 
-  allowFrom: Schema.array(Schema.string())
-    .default([])
-    .transform((v) => (Array.isArray(v) ? v : []))   // 0.1.2-rc1 控制台数组字段兜底
-    .description('允许的 userid/chatid 白名单，留空拒绝所有消息'),
 
   preset: Schema.string()
     .default('default')
@@ -610,10 +605,7 @@ export class SessionBridge {
 
     // 1. 白名单（空 = 拒绝所有）
     const key = body.chattype === 'group' ? body.chatid : body.from.userid
-    if (!this.cfg.allowFrom.length || !this.cfg.allowFrom.includes(key)) {
-      ws.respondMarkdown(reqId, '⛔ 您不在允许名单中，请联系管理员')
-      return
-    }
+   
 
     // 2. 构造 Agent 输入
     let content: string
@@ -672,7 +664,6 @@ export class SessionBridge {
 |---|---|---|
 | botId | 文本输入框 | 必填校验；description 提示单连接互踢风险 |
 | secret | **密码输入框**（遮罩） | `role('secret')` 生效；日志/dump/导出自动脱敏为 `***` |
-| allowFrom | 标签数组编辑器 | 支持逐条添加/删除；空值显示警告「当前拒绝所有消息」 |
 | preset | 文本输入框 | 可后续扩展为动态下拉（读取 preset 列表填 enum） |
 | replyMode | 单选按钮组 | markdown / stream |
 | sessionTtlMs | 数字输入框 | 低于 60000 标红 |
@@ -687,9 +678,8 @@ export class SessionBridge {
 1. **Secret 绝不落明文**：`role('secret')` 保证控制台 API、配置 dump、日志全部脱敏；自写日志**永远不要打印 `config.secret`**（订阅帧 body 同理）。
 2. **环境变量兜底**：生产环境建议 Schema 加 `.default(process.env.WECOM_SECRET)` fallback，界面配置仅作开发/调试用。
 3. **Secret 加密存储**：0.1.2-rc1 使用 AES-256-GCM 加密，密钥派生自机器指纹。**迁移服务器时需重新填写 secret**，无法直接复制配置文件。
-4. **白名单强制**：`allowFrom` 默认空数组 = 拒绝所有，避免误开放。
-5. **配置变更审计**：`apply` 时打印 `botId/preset/replyMode`（不含 secret），便于排查。
-6. **单连接提醒**：多实例部署会互踢，务必在运维文档注明。
+4. **配置变更审计**：`apply` 时打印 `botId/preset/replyMode`（不含 secret），便于排查。
+5. **单连接提醒**：多实例部署会互踢，务必在运维文档注明。
 
 ---
 
@@ -735,7 +725,6 @@ export class SessionBridge {
 - [ ] 文本消息 → Agent → markdown 回复正常
 - [ ] stream 模式打字机效果正常，finish 帧正确结束
 - [ ] 群聊消息 `@机器人` 前缀被正确去除
-- [ ] 白名单外用户收到拒绝提示；`allowFrom` 为空时全部拒绝
 
 ### M3：幂等 + 串行
 

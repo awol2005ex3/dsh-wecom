@@ -23,7 +23,10 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/wrap-client.mjs",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check:rpc": "npm run build && node scripts/check-rpc.mjs",
+    "check:agent": "npm run build && node scripts/check-ensure-agent.mjs",
+    "check": "npm run build && node scripts/check-rpc.mjs && node scripts/check-ensure-agent.mjs"
   },
   "dsh": {
     "bundle": {

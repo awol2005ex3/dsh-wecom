@@ -1,7 +1,7 @@
 // @dsh-version 0.1.2-rc.1
 import type { Context } from '@deepseek-ai/cordis'
 import { brandString } from '@deepseek-ai/dsh-brand'
-import type { AgentHandle } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-presets'
 
 import type {} from '@deepseek-ai/dsh-session'
@@ -19,6 +19,15 @@ const TURN_TIMEOUT_MS = 10 * 60_000
 
 interface WecomAgentEntry {
   handle: AgentHandle
+  /** 是否由本 bridge 创建。借用的（进程内已存在）agent 不能被本 bridge 释放。 */
+  owned: boolean
+}
+
+/** 判断是否为 session id 冲突（`sessions.prepare/enter` 抛出的唯一口径）。 */
+function isAlreadyExists(err: unknown): boolean {
+  if (!(err instanceof Error)) return false
+  const message = err.message.toLowerCase()
+  return message.includes('already exists') || message.includes('already attached')
 }
 
 /** 提取 assistant 消息中的全部文本块。 */
@@ -93,15 +102,28 @@ export class SessionBridge {
   }
 
   // ── agent 生命周期 ──────────────────────────────────────
+  /**
+   * 取（或建）该企微会话对应的 agent。
+   *
+   * session store 的 id 是进程内唯一的：`sessions.prepare()` 撞上同名会话会直接抛
+   * `session "<id>" already exists`。本 bridge 的 `agents` map 被清空而旧 agent 仍存活时
+   * （配置热更新 / 插件重载），盲目 create 必然失败，所以先借后建。
+   */
   private async ensureAgent(sessionId: string): Promise<AgentHandle> {
-    const existing = this.agents.get(sessionId)
-    if (existing) return existing.handle
+    const cached = this.agents.get(sessionId)
+    if (cached) return cached.handle
 
     const ctx = this.ctx as any
+    const sid = brandString<SessionId>(sessionId)
+
+    // 1. 进程内已有存活 agent → 借用（handle 归创建者所有，这里只用于 followup）
+    const live = ctx.agents.get(sid) as Agent | undefined
+    if (live) return this.adopt(sessionId, live, 'live agent')
+
     const preset = await ctx.agentPresets.resolve(this.cfg.preset)
     const selection = ctx.agentDefaultModel?.currentSelection?.()
-    const handle: AgentHandle = await ctx.agents.create({
-      sessionId: brandString<SessionId>(sessionId),
+    const create = (id: SessionId): Promise<AgentHandle> => ctx.agents.create({
+      sessionId: id,
       meta: { cwd: this.workspaceRoot(), agentPreset: preset.id },
       agentOptions: selection
         ? { provider: selection.provider, model: selection.model }
@@ -110,18 +132,50 @@ export class SessionBridge {
         await ctx.agentPresets.mount(agentCtx, preset.id)
       },
     })
-    this.agents.set(sessionId, { handle })
-    return handle
+
+    // 2. 正常创建
+    try {
+      const handle = await create(sid)
+      this.agents.set(sessionId, { handle, owned: true })
+      return handle
+    } catch (err) {
+      if (!isAlreadyExists(err)) throw err
+    }
+
+    // 3. 撞车：可能是并发创建刚落地，也可能是没有 agent 的残留会话
+    const raced = ctx.agents.get(sid) as Agent | undefined
+    if (raced) return this.adopt(sessionId, raced, 'raced agent')
+
+    const stale = (ctx.get('sessions') as { get(id: SessionId): unknown } | undefined)?.get(sid)
+    if (stale) {
+      // 会话还活着但没有 agent，无法接管，只能用新 id 开一轮，避免用户被卡死
+      const freshId = brandString<SessionId>(`${sessionId}#${Date.now()}`)
+      this.logger().warn('wecom: session %s 残留且无 agent，改用新会话 %s', sessionId, freshId)
+      const handle = await create(freshId)
+      this.agents.set(sessionId, { handle, owned: true })
+      return handle
+    }
+    throw new Error(`session "${sessionId}" 冲突且无法恢复`)
   }
 
-  /** 释放全部 agent（插件卸载时调用）。 */
+  /** 借用非本 bridge 创建的 agent：只用于发消息，不在 dispose 时释放。 */
+  private adopt(sessionId: string, agent: Agent, why: string): AgentHandle {
+    this.logger().info('wecom: adopt %s for %s（不再 create，避免 session 冲突）', why, sessionId)
+    const borrowed: AgentHandle = { agent, dispose: async () => {} }
+    this.agents.set(sessionId, { handle: borrowed, owned: false })
+    return borrowed
+  }
+
+  /** 释放本 bridge 创建的全部 agent（插件卸载 / 配置热更新时调用）。 */
   async dispose() {
-    for (const entry of this.agents.values()) {
+    for (const [sessionId, entry] of this.agents) {
+      if (!entry.owned) continue
       try {
         await entry.handle.dispose()
       } catch (err) {
         this.logger().warn('wecom agent dispose failed: %s', errorChain(err))
       }
+      this.agents.delete(sessionId)
     }
     this.agents.clear()
   }
@@ -131,15 +185,7 @@ export class SessionBridge {
     const reqId = pkt.headers.req_id
     const body = pkt.body
 
-    // 1. 白名单（空或 ["*"] = 允许所有）
-    const key = body.chattype === 'group' ? body.chatid : body.from.userid
-    const allowFrom: string[] = this.cfg.allowFrom ?? []
-    if (allowFrom.length && !allowFrom.includes('*') && !allowFrom.includes(key)) {
-      ws.respondMarkdown(reqId, '⛔ 您不在允许名单中，请联系管理员')
-      return
-    }
-
-    // 2. 构造 Agent 输入
+    // 1. 构造 Agent 输入
     let content: string
     switch (body.msgtype) {
       case 'text':
