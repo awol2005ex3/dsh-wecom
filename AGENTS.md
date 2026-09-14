@@ -75,6 +75,8 @@ npx @deepseek-ai/dsh plugin --profile web add .   # 链接进 web profile
     - `ensureAgent` 的五级自愈：缓存 → `ctx.agents.get(sid)` **借用**（包 `dispose` 为空的伪 handle，标 `owned:false` 不释放）→ `create` → 撞车后**再借一次** → **同 id 重试一次**（瞬时竞争）→ 仍失败则用 `${sessionId}#${Date.now()}` 开新会话。任何一步都不要抛给用户在企微里看到「处理失败」。
     - 定位手段：冲突时会打 `wecom: create session <id> 冲突（...）；诊断: agent=... session=... sessions服务=... 存活会话=N`。`sessions服务=false` 说明当前 ctx 拿不到 session store（隔离 scope 问题）；`session=true` 说明会话残留且无 agent。SessionStore **没有公开删除接口**（`detachEntered` 是私有的），残留会话只能绕开、不能清理。
 
+13. **流式必须同时转发 `text-delta` 与 `reasoning-delta`。** 推理模型（R1 / thinking）的流式几乎全是 `reasoning-delta`，若 `runTurn` 只处理 `text-delta`，思考阶段一帧都不发，长思考会直接打满企微 10 分钟流式上限、用户看到「等全部思考完才输出」。`runTurn` 的处理：`reasoning-delta` 先累积进直播内容（实时可见），遇到首个 `text-delta` 时清空思考文本、只流式答案；`turn/end` 收尾优先用 `assistant/message` 的干净答案。另设 `KEEPALIVE_MS=4s` 心跳，长空窗（思考初期 / 工具调用执行中）无 chunk 时重发占位帧保活（`buf` 非空后自动停，不覆盖已流式内容）。`StreamChunk` 类型见 `@deepseek-ai/dsh-llm`：`text-delta` / `reasoning-delta` / `tool-call-delta` / `block-start` / `block-end` / `usage` / `error` / `aborted`。
+
 ---
 
 ## API 契约速查

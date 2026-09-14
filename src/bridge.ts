@@ -13,6 +13,7 @@ import { WsClient, WecomCallbackPacket } from './ws.js'
 import { LRUCache } from './lru.js'
 import { SessionQueue } from './queue.js'
 import { MediaHandler } from './media.js'
+import { debugLog } from './debuglog.js'
 
 /**
  * 单个 agent 回合等待的兜底超时。
@@ -20,8 +21,35 @@ import { MediaHandler } from './media.js'
  */
 const TURN_TIMEOUT_MS = 5 * 60_000
 
+/** 流式长空窗保活间隔（思考初期 / 工具调用执行中等无 chunk 的间隙）。 */
+const KEEPALIVE_MS = 4_000
+
 /** `WsClient.createStreamResponder()` 的返回类型。 */
 export type StreamResponder = ReturnType<WsClient['createStreamResponder']>
+
+/**
+ * 一次企微消息对应的 agent 回合转发器。
+ *
+ * 关键：session/event 只广播给「attach 该 session 的 carrier 作用域」（agent 的 agentCtx），
+ * 注册在 wecom 插件 ctx 上永远收不到。监听挂在 agentCtx 上，事件通过本结构体转发到企微 responder。
+ */
+interface ActiveTurn {
+  responder: StreamResponder
+  streamMode: boolean
+  /** 本回合的 turn 编号（收到 turn/start 时记录，用于过滤旧回合事件）。 */
+  targetTurn: number | null
+  nText: number
+  nReason: number
+  texts: string[]
+  /** 是否已进入 text-delta（答案）阶段——进入后丢弃思考文本。 */
+  answering: boolean
+  /** 当前已流式发送到企微的内容：思考阶段=推理文本，回答阶段=答案文本。 */
+  liveBuf: string
+  settled: boolean
+  resolve: () => void
+  timer: ReturnType<typeof setTimeout>
+  heartbeat: ReturnType<typeof setInterval>
+}
 
 interface WecomAgentEntry {
   handle: AgentHandle
@@ -53,6 +81,10 @@ export class SessionBridge {
   private queue = new SessionQueue()
   private media: MediaHandler
   private agents = new Map<string, WecomAgentEntry>()
+  /** sessionId -> 当前活跃回合转发器（同一会话串行处理，故同一时刻至多一个）。 */
+  private activeTurns = new Map<string, ActiveTurn>()
+  /** 已注册 session/event 监听的 agent ctx（按对象去重，避免重复注册）。 */
+  private sessionListeners = new WeakSet<object>()
 
   constructor(private ctx: Context, private cfg: any) {
     this.media = new MediaHandler({
@@ -132,6 +164,7 @@ export class SessionBridge {
 
     const preset = await ctx.agentPresets.resolve(this.cfg.preset)
     const selection = ctx.agentDefaultModel?.currentSelection?.()
+    debugLog(`[model] provider=${selection?.provider ?? '?'} model=${selection?.model ?? '?'}`)
     const create = (id: SessionId): Promise<AgentHandle> => ctx.agents.create({
       sessionId: id,
       meta: { cwd: this.workspaceRoot(), agentPreset: preset.id },
@@ -140,6 +173,9 @@ export class SessionBridge {
         : undefined,
       setup: async (agentCtx: Context) => {
         await ctx.agentPresets.mount(agentCtx, preset.id)
+        // 关键修复：session/event 只广播给 attach 该 session 的 carrier 作用域（即 agentCtx），
+        // 注册在 wecom 插件 ctx 上收不到任何 chunk / turn/end。监听必须挂在 agentCtx 上。
+        this.registerSessionListener(agentCtx)
       },
     })
 
@@ -261,85 +297,107 @@ export class SessionBridge {
         return
     }
 
-    // 3. 调用 Agent：先注册事件监听再入队消息，避免丢失 turn 事件
+    // 2. 取/建 agent，并在其 carrier 作用域注册 session/event 监听（核心修复），
+    //    随后把本回合的转发器写入 activeTurns，跟随该 session 的生命周期事件转发到企微。
     try {
       const handle = await this.ensureAgent(sessionId)
-      const turn = this.runTurn(handle, responder)
+      this.registerSessionListener((handle.agent as any).ctx)  // 借用场景兜底（create 已在 setup 注册）
+      const sid = String(handle.agent.session.id)
+      const streamMode = this.cfg.replyMode === 'stream'
+
+      const turn = new Promise<void>((resolve) => {
+        const at: ActiveTurn = {
+          responder, streamMode,
+          targetTurn: null, nText: 0, nReason: 0,
+          texts: [], answering: false, liveBuf: '',
+          settled: false, resolve,
+          timer: setTimeout(() => {
+            if (at.settled) return
+            at.settled = true
+            clearInterval(at.heartbeat)
+            this.activeTurns.delete(sid)
+            debugLog(`[turn] TIMEOUT sid=${sid} mode=${streamMode} textDelta=${at.nText} reasonDelta=${at.nReason}`)
+            at.responder.finish('处理超时，请稍后再试')
+            resolve()
+          }, TURN_TIMEOUT_MS),
+          heartbeat: setInterval(() => {
+            if (!at.settled) at.responder.keepAlive()
+          }, KEEPALIVE_MS),
+        }
+        this.activeTurns.set(sid, at)
+      })
+
       handle.agent.followup(createUserMessage({
         content: [{ type: 'text', text: content }],
         source: { kind: 'plugin', plugin: 'wecom' },
       }))
       await turn
     } catch (err: any) {
+      debugLog(`[process] error: ${errorMessage(err)}`)
       responder.finish(`处理失败：${errorChain(err)}`)
     }
   }
 
+  /** 在 agent 的 carrier 作用域（agentCtx）注册 session/event 监听，同一 ctx 只注册一次。 */
+  private registerSessionListener(agentCtx: Context | undefined) {
+    if (!agentCtx || this.sessionListeners.has(agentCtx)) return
+    this.sessionListeners.add(agentCtx)
+    agentCtx.on('session/event', (session: any, event: any) => this.onSessionEvent(session, event))
+  }
+
   /**
-   * 等待一次 followup 对应的 agent 回合结束，并把输出转发给企微。
-   *
-   * 占位流已在 process() 里开好，这里只负责刷新与收尾：
-   * - stream 模式：逐 token（text-delta）累积推流，turn/end 时 finish 全量内容
-   * - markdown 模式：过程中不刷新，turn/end 时把最后一条 assistant 消息一次性 finish
+   * session/event 总线回调（监听挂在 agent 的 carrier 作用域上，故能收到该 session 的事件）。
+   * 根据 session.id 找到当前活跃回合转发器，把增量 / 消息 / 结束事件转发给企微。
    */
-  private runTurn(handle: AgentHandle, responder: StreamResponder): Promise<void> {
-    const sid = handle.agent.session.id
-    const streamMode = this.cfg.replyMode === 'stream'
-    const texts: string[] = []
+  private onSessionEvent(session: any, event: any) {
+    const at = this.activeTurns.get(String(session.id))
+    if (!at || at.settled) return
+    const sid = String(session.id)
 
-    return new Promise<void>((resolve, reject) => {
-      let targetTurn: number | null = null
-      let settled = false
+    if (event.type === 'turn/start') {
+      if (at.targetTurn === null) at.targetTurn = event.data.turn
+      return
+    }
+    if (at.targetTurn === null) return
 
-      const cleanup = () => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        off()
+    if (at.streamMode
+      && event.type === 'assistant/chunk'
+      && event.data.turn === at.targetTurn) {
+      const chunk = event.data.chunk
+      if (chunk?.type === 'text-delta') {
+        at.nText++
+        if (!at.answering) { at.answering = true; at.liveBuf = '' }  // 进入答案：丢弃思考文本，仅流式答案
+        at.liveBuf += chunk.text
+        at.responder.append(at.liveBuf)
+        return
       }
-
-      const off = this.ctx.on('session/event', (session, event) => {
-        if (session.id !== sid) return
-        if (event.type === 'turn/start') {
-          if (targetTurn === null) targetTurn = event.data.turn
-          return
-        }
-        if (targetTurn === null) return
-
-        if (streamMode
-          && event.type === 'assistant/chunk'
-          && event.data.turn === targetTurn
-          && event.data.chunk.type === 'text-delta') {
-          responder.append(event.data.chunk.text)
-          return
-        }
-        if (event.type === 'assistant/message' && event.data.turn === targetTurn) {
-          const text = extractText(event.data.message.content)
-          if (text) texts.push(text)
-          return
-        }
-        if (event.type === 'turn/end' && event.data.turn === targetTurn) {
-          const reason = event.data.reason
-          cleanup()
-          if (reason.kind === 'error') {
-            // 占位帧已经发过，必须用 finish 收尾（错误文案替换占位），
-            // 不能再走一次性 markdown —— 那时 req_id 早已超过 5 秒窗口。
-            responder.finish(`处理失败：${reason.error?.message ?? 'agent turn failed'}`)
-            resolve()
-            return
-          }
-          // 不给兜底文案：没拿到 assistant/message 时由 ws 层回退到累积的流式内容
-          responder.finish(texts.length ? texts[texts.length - 1] : '')
-          resolve()
-        }
-      })
-
-      const timer = setTimeout(() => {
-        // 首帧起 10 分钟企微会强制结束流式消息，这里留一半余量主动收尾
-        responder.finish('处理超时，请稍后再试')
-        cleanup()
-        resolve()
-      }, TURN_TIMEOUT_MS)
-    })
+      if (chunk?.type === 'reasoning-delta' && !at.answering) {
+        at.nReason++
+        at.liveBuf += chunk.text
+        at.responder.append(at.liveBuf)
+        return
+      }
+    }
+    if (event.type === 'assistant/message' && event.data.turn === at.targetTurn) {
+      const text = extractText(event.data.message.content)
+      if (text) at.texts.push(text)
+      return
+    }
+    if (event.type === 'turn/end' && event.data.turn === at.targetTurn) {
+      at.settled = true
+      clearTimeout(at.timer)
+      clearInterval(at.heartbeat)
+      this.activeTurns.delete(sid)
+      debugLog(`[turn] sid=${sid} mode=${at.streamMode} textDelta=${at.nText} reasonDelta=${at.nReason} msgLen=${at.texts.join('').length}`)
+      const reason = event.data.reason
+      if (reason.kind === 'error') {
+        // 占位帧已经发过，必须用 finish 收尾（错误文案替换占位），不能再走一次性 markdown
+        at.responder.finish(`处理失败：${reason.error?.message ?? 'agent turn failed'}`)
+      } else {
+        // 优先用 assistant/message 的干净答案；拿不到时回退到流式累积内容
+        at.responder.finish(at.texts.length ? at.texts[at.texts.length - 1] : at.liveBuf)
+      }
+      at.resolve()
+    }
   }
 }

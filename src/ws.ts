@@ -258,6 +258,17 @@ export class WsClient extends EventEmitter {
         }
       },
       /**
+       * 保活：长空窗（推理模型思考初期、工具调用执行中）没有任何 chunk 时，
+       * 重发占位帧，避免用户在企微端看到“… ”一直转且最终因超时被丢弃。
+       * 一旦 append 过真实内容（buf 非空）就不再覆盖，避免冲掉已流式的内容。
+       */
+      keepAlive: () => {
+        if (!buf) {
+          this.sendStreamChunk(reqId, streamId, placeholder, false)
+          lastPush = Date.now()
+        }
+      },
+      /**
        * 结束流式：content 为全量内容。
        * 显式给了 finalText 就用它（回合结果 / 错误文案 / 超时提示优先），
        * 否则退回累积的 buf，都为空时给一句兜底文案。

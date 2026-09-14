@@ -10,39 +10,47 @@ import { SessionBridge } from '../lib/bridge.js'
 import { pickFinal } from '../lib/ws.js'
 
 function makeCtx({ onTurn }) {
-  const listeners = []
   return {
-    listeners,
     logger: () => ({ info() {}, warn() {}, error() {}, debug() {} }),
     agents: {
       get: () => undefined,
-      create: async (opts) => ({
-        agent: {
-          session: { id: opts.sessionId },
-          followup: () => { setTimeout(() => onTurn(opts.sessionId, listeners), 0) },
-        },
-        dispose: async () => {},
-      }),
+      // create 返回的 agent 把 session/event 监听挂在 agent.ctx 上（与 harness carrier 作用域一致）
+      create: async (opts) => {
+        const agentListeners = []
+        const agentCtx = { on: (_event, cb) => { agentListeners.push(cb); return () => {} } }
+        return {
+          agent: {
+            session: { id: opts.sessionId },
+            ctx: agentCtx,
+            followup: () => { setTimeout(() => onTurn(opts.sessionId, agentListeners), 0) },
+          },
+          dispose: async () => {},
+        }
+      },
     },
     agentPresets: { resolve: async (id) => ({ id }), mount: async () => {} },
     agentDefaultModel: { currentSelection: () => undefined },
     sandboxPolicy: { resolve: () => ({ workspaceRoot: process.cwd() }) },
     get: () => undefined,
-    on: (_event, cb) => { listeners.push(cb); return () => {} },
+    // wecom 插件 ctx 上的 on 不再承载 session/event 监听（核心修复）
+    on: () => () => {},
   }
 }
 
-/** 假 WsClient：只记录发出的帧。 */
+/** 假 WsClient：记录发出的帧，以及每次 append 的增量（用于断言流式确实发生了）。 */
 function makeWs() {
   const frames = []
+  const deltas = []
   return {
     frames,
+    deltas,
     createStreamResponder(reqId, placeholder = '思考中…') {
       let buf = ''
       const push = (content, finish) => { frames.push({ reqId, content, finish }); return true }
       push(placeholder, false)
       return {
-        append: (delta) => { buf += delta },
+        append: (delta) => { buf += delta; deltas.push(delta) },
+        keepAlive: () => { if (!buf) push(placeholder, false) },
         finish: (finalText) => push(pickFinal(buf, finalText), true),
         get pushed() { return true },
       }
@@ -113,6 +121,27 @@ async function run(replyMode, onTurn) {
   assert.equal(ws.frames.length, 2)
   assert.match(ws.frames[1].content, /llm down/)
   assert.equal(ws.frames[1].finish, true)
+}
+
+// 4. 推理模型：reasoning-delta 也要实时流式，而不是干等思考结束
+{
+  const ctx = makeCtx({ onTurn: (sid, listeners) => {
+    const emit = (event) => { for (const cb of listeners) cb({ id: sid }, event) }
+    emit({ type: 'turn/start', data: { turn: 1 } })
+    emit({ type: 'assistant/chunk', data: { turn: 1, chunk: { type: 'reasoning-delta', text: '让我想想' } } })
+    emit({ type: 'assistant/chunk', data: { turn: 1, chunk: { type: 'reasoning-delta', text: '，再算算' } } })
+    emit({ type: 'assistant/chunk', data: { turn: 1, chunk: { type: 'text-delta', text: '答案是42' } } })
+    emit({ type: 'assistant/message', data: { turn: 1, message: { content: [{ type: 'text', text: '答案是42' }] } } })
+    emit({ type: 'turn/end', data: { turn: 1, reason: { kind: 'stop' } } })
+  } })
+  const ws = makeWs()
+  const bridge = new SessionBridge(ctx, { preset: 'standard', replyMode: 'stream' })
+  bridge.handle(packet('m-reason', '深度思考一下'), ws)
+  for (let i = 0; i < 50 && !ws.frames.some((f) => f.finish); i++) await new Promise((r) => setTimeout(r, 10))
+  await bridge.dispose()
+  assert.ok(ws.deltas.length >= 3, `推理+回答都应流式：deltas=${JSON.stringify(ws.deltas)}`)
+  assert.equal(ws.frames[ws.frames.length - 1].content, '答案是42', '最终消息应是干净答案（不混入思考文本）')
+  assert.equal(ws.frames[ws.frames.length - 1].finish, true)
 }
 
 console.log('check-reply: OK')
