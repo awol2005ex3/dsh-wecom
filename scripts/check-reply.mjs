@@ -204,4 +204,26 @@ async function run(replyMode, onTurn) {
   assert.equal(ws.frames[ws.frames.length - 1].finish, true)
 }
 
+// 7. 工具调用后模型未产出文本答案（复现「卡在工具标记上」）：
+//    思考+工具标记都显示了，但工具失败/模型中断导致没有任何 text-delta 与 cleanText。
+//    收尾【绝不能】把「正在调用工具」标记当终稿回显，必须给一句明确提示。
+{
+  const ctx = makeCtx({ onTurn: (sid, { streamListeners, sessionListeners, agent }) => {
+    stream(streamListeners, agent, { type: 'start', turn: 1 })
+    stream(streamListeners, agent, { type: 'chunk', turn: 1, chunk: { type: 'reasoning-delta', text: '我需要查一下' } })
+    // 仅产出工具调用，随后 end 帧为 committed/assistant/message 但 message 无文本（工具失败、模型中断）
+    stream(streamListeners, agent, { type: 'chunk', turn: 1, chunk: { type: 'tool-call-delta', id: 'c1', name: 'web_search', argumentsDelta: '{}' } })
+    stream(streamListeners, agent, { type: 'end', turn: 1, outcome: { kind: 'committed', eventType: 'assistant/message', seq: 1 } })
+  } })
+  const ws = makeWs()
+  const bridge = new SessionBridge(ctx, { preset: 'standard', replyMode: 'stream' })
+  bridge.handle(packet('m-tool-fail', '查人均用电量前五'), ws)
+  for (let i = 0; i < 50 && !ws.frames.some((f) => f.finish); i++) await new Promise((r) => setTimeout(r, 10))
+  await bridge.dispose()
+  const last = ws.frames[ws.frames.length - 1]
+  assert.equal(last.finish, true)
+  assert.ok(!last.content.includes('正在调用工具'), `收尾绝不能回显工具标记：${last.content}`)
+  assert.match(last.content, /未返回文本结果|未生成回复/, `应给明确提示而非冻结：${last.content}`)
+}
+
 console.log('check-reply: OK')

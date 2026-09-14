@@ -427,8 +427,9 @@ export class SessionBridge {
       clearInterval(at.heartbeat)
       this.activeTurns.delete(String(agent.session.id))
       debugLog(`[turn] sid=${String(agent.session.id)} mode=${at.streamMode} text=${at.nText} reason=${at.nReason} outcome=${outcome?.kind}/${outcome?.eventType} clean=${at.cleanText.length}`)
-      // 优先用干净终稿（assistant/message）；未带则 finish 用内部已流式 buf 兜底
-      at.responder.finish(at.cleanText)
+      // 收尾内容走 finalContent：干净终稿优先，其次已流式答案；
+      // 整轮无文本答案时绝不回退成「正在调用工具」标记（会像卡死），改用明确提示。
+      at.responder.finish(this.finalContent(at))
       at.resolve()
     }
   }
@@ -465,8 +466,23 @@ export class SessionBridge {
       clearInterval(at.heartbeat)
       this.activeTurns.delete(String(session.id))
       debugLog(`[turn] END sid=${String(session.id)} reason=${reason?.kind} 兜底收尾 clean=${at.cleanText.length}`)
-      at.responder.finish(at.cleanText)  // 未带 cleanText 时 finish 用内部已流式 buf 兜底
+      at.responder.finish(this.finalContent(at))  // 未带 cleanText 时走 finalContent 兜底逻辑
       at.resolve()
     }
+  }
+
+  /**
+   * 收尾内容选择器：干净终稿 > 已流式答案(buf) > 明确提示。
+   * 关键：当本轮没有任何文本答案（模型只思考 + 调工具后因工具失败而中断，
+   * cleanText 为空、nText=0）时，【绝不】把「⏳ 正在调用工具：xxx…」标记当最终内容回显
+   * ——否则用户看到的就是「卡在工具标记上、像断了」。改用一句明确提示。
+   */
+  private finalContent(at: ActiveTurn): string | undefined {
+    if (at.cleanText && at.cleanText.trim()) return at.cleanText
+    if (at.nText > 0) return undefined  // 交给 responder.finish 用内部 buf（首个 text-delta 已 reset 为纯答案）
+    if (at.toolCallsShown.size > 0) {
+      return `⚠️ 已调用工具（${[...at.toolCallsShown].join('、')}）但未返回文本结果，请稍后重试或更换问题。`
+    }
+    return '（本次未生成回复内容）'
   }
 }
