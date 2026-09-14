@@ -75,9 +75,10 @@ npx @deepseek-ai/dsh plugin --profile web add .   # 链接进 web profile
     - `ensureAgent` 的五级自愈：缓存 → `ctx.agents.get(sid)` **借用**（包 `dispose` 为空的伪 handle，标 `owned:false` 不释放）→ `create` → 撞车后**再借一次** → **同 id 重试一次**（瞬时竞争）→ 仍失败则用 `${sessionId}#${Date.now()}` 开新会话。任何一步都不要抛给用户在企微里看到「处理失败」。
     - 定位手段：冲突时会打 `wecom: create session <id> 冲突（...）；诊断: agent=... session=... sessions服务=... 存活会话=N`。`sessions服务=false` 说明当前 ctx 拿不到 session store（隔离 scope 问题）；`session=true` 说明会话残留且无 agent。SessionStore **没有公开删除接口**（`detachEntered` 是私有的），残留会话只能绕开、不能清理。
 
-13. **流式必须同时转发 `text-delta` 与 `reasoning-delta`，且增量只能来自 `agent/assistant-stream`。** 推理模型（Qwen3-thinking / R1 等）的流式几乎全是 `reasoning-delta`，若 `onAgentStream` 只处理 `text-delta`，思考阶段一帧都不发，长思考会直接打满企微 10 分钟流式上限、用户看到「等全部思考完才输出」。**关键事实：`session/event` 总线在生产代码中【从不】携带增量 chunk**（只有 `assistant/message` 终稿与 `turn/end`），实时流必须监听 `agent/assistant-stream`（`payload.frame.chunk.type`）。** `onAgentStream` 的处理：`reasoning-delta` 累积进直播内容（实时可见），`tool-call-delta` 透出「⏳ 正在调用工具：<name>…」标记（长工具执行间隙至少让用户看到进度，避免像卡死），遇到首个 `text-delta` 时用 `reset` 清空思考文本、只流式答案；`end` 帧收尾优先用 `assistant/message` 的干净答案。`StreamChunk` 类型见 `@deepseek-ai/dsh-llm`：`text-delta` / `reasoning-delta` / `tool-call-delta`(`name`+`argumentsDelta`) / `block-start`(`blockType`) / `block-end` / `usage` / `finish`。
+13. **流式必须同时转发 `text-delta` 与 `reasoning-delta`，且增量只能来自 `agent/assistant-stream`。** 推理模型（Qwen3-thinking / R1 等）的流式几乎全是 `reasoning-delta`，若 `onAgentStream` 只处理 `text-delta`，思考阶段一帧都不发，长思考会直接打满企微 10 分钟流式上限、用户看到「等全部思考完才输出」。**关键事实：`session/event` 总线在生产代码中【从不】携带增量 chunk**（只有 `assistant/message` 终稿与 `turn/end`），实时流必须监听 `agent/assistant-stream`（`payload.frame.chunk.type`）。** `onAgentStream` 的处理：`reasoning-delta` 累积进直播内容（实时可见），`tool-call-delta` 透出「⏳ 正在调用工具：<name>…」标记（长工具执行间隙至少让用户看到进度，避免像卡死），遇到首个 `text-delta` 时用 `reset` 清空思考文本、只流式答案。**`onAgentStream` 只转发 chunk，绝不在 `end` 帧收尾**（收尾唯一交给 `session/event` 的 `turn/end`）。`StreamChunk` 类型见 `@deepseek-ai/dsh-llm`：`text-delta` / `reasoning-delta` / `tool-call-delta`(`name`+`argumentsDelta`) / `block-start`(`blockType`) / `block-end` / `usage` / `finish`。
    **三个已踩的致命坑（改流式前必读）：** ① **绝不要用 `frame.turn` 过滤**——生产帧 `frame.turn` 恒为 `undefined`，且 `start` 帧不一定到达；一旦写 `if (frame.turn !== targetTurn) return` 这类守卫，所有增量帧与成功 `end` 帧都被静默丢弃，表现就是「选了流式也看不到思考、只剩终稿」。直接按 `payload.agent === agent` 过滤即可。② **`WsClient.append` 是增量累加（`buf += delta` 后发全量），转发时传单块 `chunk.text`，不要传自己累积的全量（会双重叠加成巨型内容）；思考切答案用 `responder.reset(content)` 整段替换，而非继续 append。③ **`keepAlive` 必须「无条件」重发当前内容（`buf || placeholder`）**——一旦只在 `buf` 为空时才保活，思考首帧 append 之后 `buf` 即非空、心跳转静默；工具调用执行几十秒~几分钟的长空窗里企微把这条空闲流超时掐断，工具之后的答案帧全被丢弃，表现就是「思考过程能看到、工具调用后什么都不出」。改为每 4s 重发同一份内容（企微只保持该流式消息、无视觉变化），即可撑过工具空窗。
    **第四个坑（收尾内容选取）：** 当一轮**没有任何文本答案**（`cleanText` 为空且 `nText===0`，典型是工具调用失败/模型中断后直接 `end`）时，`finish` 的兜底**绝不能回退成「⏳ 正在调用工具：xxx…」标记**——否则用户看到的就是「卡在工具标记上、像断了」。必须用 `finalContent()` 选择器：干净终稿 > 已流式答案(buf) > 明确提示（「⚠️ 已调用工具（xxx）但未返回文本结果」/「本次未生成回复内容」）。工具标记只应出现在流式进行中，绝不该成为终稿。
+   **第五个坑（收尾信号唯一性，本轮根因）：`agent/assistant-stream` 的 `end` 帧【绝不能】用作回合结束信号。** 多工具循环里每次工具调用都是一次独立 attempt，harness 在 `agent-loop/src/agent.ts:474` 对**每次成功 attempt** 都 `live.settle('assistant/message', …)`——所以「只调了工具、尚无文本答案」的中间 attempt 也会发出 `committed / eventType==='assistant/message'` 的 `end` 帧（因此旧的 `eventType !== 'assistant/message'` 判断根本挡不住它）。在此收尾就会**在模型还在执行/准备下一个工具时提前切断**，并按 `finalContent` 判空误报「⚠️ 已调用工具但未返回文本结果」，同时丢掉后续 attempt 产出的真实答案——表现就是「报警告，但 dsh 会话其实还在继续」。**唯一可靠的回合终点是 `session/event` 的 `turn/end`**（在 `agent.ts` 外层 `turn()` 的 `finally`，整段工具循环跑完之后才 append，每个逻辑回合仅一次）。正确分层：`onAgentStream` 只转发增量（`if (frame.type !== 'chunk') return`，`start`/`end` 一律不收尾）；收尾全部交给 `onSessionEvent` 的 `turn/end`（`reason.kind==='error'` → 错误文案；非 error → `finalContent`），外加 `TURN_TIMEOUT_MS` 兜底。
 
 ---
 
@@ -148,10 +149,12 @@ ctx.on('agent/assistant-stream', (payload: { agent: Agent; frame: any }) => {
   }
   else if (frame.type === 'end') {
     // frame.outcome.kind: 'committed'（成功/失败都可能是它）或 'abandoned'
-    //   committed 且 eventType === 'assistant/message' → 成功产出用户消息（收尾用 cleanText）
-    //   committed 且 eventType === 'assistant/attempt' → 本次尝试未产出消息（★真实 LLM 失败路径★）
+    //   committed 且 eventType === 'assistant/message' → 本次 attempt 产出了一条消息（★注意：多工具
+    //     循环里「只调了工具、还没有文本答案」的中间 attempt 也是它★，因为工具调用本身就在该消息里）
+    //   committed 且 eventType === 'assistant/attempt' → 本次尝试未产出消息（LLM 失败路径）
     //   abandoned → 持久化 append 失败（罕见）
-    // 见 src/bridge.ts 的 onAgentStream：遇到「无用户消息」的 end 帧必须 defer 给 turn/end 错误分支
+    // 【本帧绝不用于收尾】——end 每次 attempt 都发，早于最终答案；收尾唯一交给 session/event 的 turn/end。
+    // 见 src/bridge.ts 的 onAgentStream（只转发 chunk）。
   }
 })
 ```

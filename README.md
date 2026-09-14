@@ -121,14 +121,14 @@ npx @deepseek-ai/dsh plugin --profile web add /path/to/dsh-plugin-wecom
                                         ↓
                           DSH Agent（事件驱动回复）
                                         ↓
-                    agent/assistant-stream → 流式推送（reasoning-delta + text-delta）
-                    session/event → assistant/message（干净终稿）/ turn/end（错误）
+                    agent/assistant-stream → 流式推送（reasoning-delta + text-delta），仅转发、不收尾
+                    session/event → assistant/message（干净终稿）+ turn/end（★唯一收尾信号★）
 ```
 
 - **WsClient**：企微长连接协议实现（订阅/心跳/重连/回复方法），与 DSH 解耦。
 - **SessionBridge**：消息分发、白名单校验、幂等去重、会话串行队列、Agent 调用协调。
 - **MediaHandler**：沙箱内媒体文件下载/上传（使用 Node 原生 `fetch` + `FormData`）。
-- **Agent 桥接**：每个企微会话对应一个 DSH agent session，`followup` 发消息 → 实时增量来自 `agent/assistant-stream`（`frame.chunk.type` 为 `reasoning-delta` / `text-delta`），终稿与错误来自 `session/event`（`assistant/message` / `turn/end`）。**注意 `session/event` 不携带增量 chunk**。
+- **Agent 桥接**：每个企微会话对应一个 DSH agent session，`followup` 发消息 → 实时增量来自 `agent/assistant-stream`（`frame.chunk.type` 为 `reasoning-delta` / `text-delta`），干净终稿与错误来自 `session/event`（`assistant/message` / `turn/end`）。**注意 `session/event` 不携带增量 chunk**；**收尾只认 `turn/end`**——`agent/assistant-stream` 的 `end` 帧每次 attempt 都发（多工具循环里中间那次只调了工具、尚无文本答案），用它收尾会提前切断并丢掉最终答案。
 
 ## 常见问题
 

@@ -373,65 +373,46 @@ export class SessionBridge {
     // 注：harness 生产帧的 frame.turn 恒为 undefined，且 start 帧不一定到达本监听器，
     // 故【不】依赖 turn 编号做过滤——已按 payload.agent === agent 精确匹配，
     // 且每会话串行（queue），同一时刻仅一个活跃回合，无需 turn 维度去重。
-    if (frame.type === 'start') return  // 仅占位标记，不做任何依赖
+    //
+    // 关键约束：start / end 仅占位标记，【绝不在 end 帧收尾】。多工具循环里每次工具调用都是
+    // 一次独立 attempt，其 end 帧同样带 committed/assistant/message（见 harness agent.ts:474 的
+    // live.settle('assistant/message')），但此时往往尚无文本答案；若在此收尾，会把「⏳ 正在调用工具」
+    // 标记或空内容误当最终回复，并且会丢弃该 attempt 之后其它 attempt 产出的真实答案（当前 bug 根因）。
+    // 真正的回合终点是 session/event 的 turn/end：每个逻辑回合仅发一次，位于 agent.ts 外层
+    // turn() 的 finally，整段工具循环跑完之后才 append。故收尾只交给 onSessionEvent 的 turn/end
+    // 分支（+ 超时兜底），这里只把实时增量转发出去。
+    if (frame.type !== 'chunk') return
 
-    if (frame.type === 'chunk') {
-      const chunk = frame.chunk
-      if (chunk?.type === 'reasoning-delta') {
-        at.nReason++
-        // 思考过程实时可见：逐 delta 增量推送（responder.append 内部已累积并节流）
-        if (!at.answering && at.streamMode) at.responder.append(chunk.text)
-        return
-      }
-      if (chunk?.type === 'text-delta') {
-        at.nText++
-        if (!at.answering) {
-          at.answering = true
-          // 进入答案：清空已展示的推理文本（含「正在调用工具」标记），从答案开头重新流式，
-          // 避免「先发空帧再补答案」的闪烁，也避免推理+答案重复堆砌
-          if (at.streamMode) at.responder.reset(chunk.text)
-        } else if (at.streamMode) {
-          at.responder.append(chunk.text)
-        }
-        return
-      }
-      if (chunk?.type === 'tool-call-delta') {
-        // 工具调用可见标记：长工具执行间隙用户至少能看到「正在调用 XX…」，
-        // 避免「思考出了一截、调工具后整条流像卡死」的观感；答案到达后由 reset 整体替换。
-        const toolName = chunk.name
-        if (at.streamMode && toolName && !at.toolCallsShown.has(toolName)) {
-          at.toolCallsShown.add(toolName)
-          at.responder.append(`\n⏳ 正在调用工具：${toolName}…\n`)
-        }
-        return
-      }
-      // block-start / block-end / usage / finish 等不携带用户可见文本，忽略
+    const chunk = frame.chunk
+    if (chunk?.type === 'reasoning-delta') {
+      at.nReason++
+      // 思考过程实时可见：逐 delta 增量推送（responder.append 内部已累积并节流）
+      if (!at.answering && at.streamMode) at.responder.append(chunk.text)
       return
     }
-    if (frame.type === 'end') {
-      const outcome = frame.outcome
-      // 失败 / 中断 / 持久化异常：本次尝试未产出可交付给用户的最终消息
-      // （outcome.kind === 'abandoned'，或 committed 但 eventType 为 'assistant/attempt'），
-      // 不应以当前 buf 收尾，交由 session/event 的 turn/end 错误分支给出文案。
-      // 注意：真实 LLM 失败走的是「committed + assistant/attempt」而非 abandoned——
-      // harness 会先提交这次（可能部分的）尝试，再 throw，最终由 turn/end 携带错误原因。
-      const noUserMessage =
-        outcome?.kind === 'abandoned' ||
-        (outcome?.kind === 'committed' && outcome.eventType !== 'assistant/message')
-      if (noUserMessage) {
-        debugLog(`[turn] sid=${String(agent.session.id)} outcome=${outcome?.kind}/${outcome?.eventType} 无用户消息，等待 turn/end 错误分支`)
-        return
+    if (chunk?.type === 'text-delta') {
+      at.nText++
+      if (!at.answering) {
+        at.answering = true
+        // 进入答案：清空已展示的推理文本（含「正在调用工具」标记），从答案开头重新流式，
+        // 避免「先发空帧再补答案」的闪烁，也避免推理+答案重复堆砌
+        if (at.streamMode) at.responder.reset(chunk.text)
+      } else if (at.streamMode) {
+        at.responder.append(chunk.text)
       }
-      at.settled = true
-      clearTimeout(at.timer)
-      clearInterval(at.heartbeat)
-      this.activeTurns.delete(String(agent.session.id))
-      debugLog(`[turn] sid=${String(agent.session.id)} mode=${at.streamMode} text=${at.nText} reason=${at.nReason} outcome=${outcome?.kind}/${outcome?.eventType} clean=${at.cleanText.length}`)
-      // 收尾内容走 finalContent：干净终稿优先，其次已流式答案；
-      // 整轮无文本答案时绝不回退成「正在调用工具」标记（会像卡死），改用明确提示。
-      at.responder.finish(this.finalContent(at))
-      at.resolve()
+      return
     }
+    if (chunk?.type === 'tool-call-delta') {
+      // 工具调用可见标记：长工具执行间隙用户至少能看到「正在调用 XX…」，
+      // 避免「思考出了一截、调工具后整条流像卡死」的观感；答案到达后由 reset 整体替换。
+      const toolName = chunk.name
+      if (at.streamMode && toolName && !at.toolCallsShown.has(toolName)) {
+        at.toolCallsShown.add(toolName)
+        at.responder.append(`\n⏳ 正在调用工具：${toolName}…\n`)
+      }
+      return
+    }
+    // block-start / block-end / usage / finish 等不携带用户可见文本，忽略
   }
 
   /**

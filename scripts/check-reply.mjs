@@ -6,10 +6,13 @@
  * 本测试据此构造两套监听，模拟 harness 的真实事件来源。
  *
  *   1. 收到消息**立刻**发出流式占位帧（5 秒窗口要求）
- *   2. stream 模式逐段刷新（推理+答案都实时），end 帧时 finish 全量内容
- *   3. markdown 模式过程不刷新，end 帧时一次性 finish
+ *   2. stream 模式逐段刷新（推理+答案都实时），turn/end 时 finish 全量内容
+ *   3. markdown 模式过程不刷新，turn/end 时一次性 finish
  *   4. 错误 / 超时分支也必须用 finish 收尾，不能改用一次性 markdown
  *   5. 推理模型：reasoning-delta 实时可见，最终消息是干净答案（不混入思考文本）
+ *   6. **收尾信号唯一来自 session/event 的 turn/end**（每个逻辑回合仅一次）；
+ *      agent/assistant-stream 的 end 帧绝不收尾（多工具循环里中间 attempt 的 end 帧
+ *      带 committed/assistant/message 但尚无文本，提前收尾会丢掉后续真实答案）
  */
 import assert from 'node:assert/strict'
 import { SessionBridge } from '../lib/bridge.js'
@@ -96,6 +99,8 @@ function emitTurn(sessionId, { streamListeners, sessionListeners, agent }, { err
   if (!error) {
     session(sessionListeners, sessionId, { type: 'assistant/message', data: { turn: 1, message: { content: [{ type: 'text', text: '你好，世界' }] } } })
     stream(streamListeners, agent, { type: 'end', turn: 1, outcome: { kind: 'committed', eventType: 'assistant/message', seq: 1 } })
+    // 真正的回合终点：session/event 的 turn/end（agent/assistant-stream 的 end 帧绝不作为收尾信号）
+    session(sessionListeners, sessionId, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
   } else if (error === 'abandoned') {
     // 罕见路径：持久化 append 失败 → harness 发 abandoned 的 end 帧，无用户消息
     stream(streamListeners, agent, { type: 'end', turn: 1, outcome: { kind: 'abandoned' } })
@@ -158,6 +163,7 @@ async function run(replyMode, onTurn) {
     stream(streamListeners, agent, { type: 'chunk', turn: 1, chunk: { type: 'text-delta', text: '答案是42' } })
     session(sessionListeners, sid, { type: 'assistant/message', data: { turn: 1, message: { content: [{ type: 'text', text: '答案是42' }] } } })
     stream(streamListeners, agent, { type: 'end', turn: 1, outcome: { kind: 'committed', eventType: 'assistant/message', seq: 1 } })
+    session(sessionListeners, sid, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
   } })
   const ws = makeWs()
   const bridge = new SessionBridge(ctx, { preset: 'standard', replyMode: 'stream' })
@@ -193,6 +199,7 @@ async function run(replyMode, onTurn) {
     stream(streamListeners, agent, { type: 'chunk', turn: 1, chunk: { type: 'text-delta', text: '上海北京江苏浙江福建' } })
     session(sessionListeners, sid, { type: 'assistant/message', data: { turn: 1, message: { content: [{ type: 'text', text: '前5名是上海北京江苏浙江福建' }] } } })
     stream(streamListeners, agent, { type: 'end', turn: 1, outcome: { kind: 'committed', eventType: 'assistant/message', seq: 2 } })
+    session(sessionListeners, sid, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
   } })
   const ws = makeWs()
   const bridge = new SessionBridge(ctx, { preset: 'standard', replyMode: 'stream' })
@@ -214,6 +221,8 @@ async function run(replyMode, onTurn) {
     // 仅产出工具调用，随后 end 帧为 committed/assistant/message 但 message 无文本（工具失败、模型中断）
     stream(streamListeners, agent, { type: 'chunk', turn: 1, chunk: { type: 'tool-call-delta', id: 'c1', name: 'web_search', argumentsDelta: '{}' } })
     stream(streamListeners, agent, { type: 'end', turn: 1, outcome: { kind: 'committed', eventType: 'assistant/message', seq: 1 } })
+    // 回合真正结束：turn/end（无文本答案）→ 走 finalContent 警告兜底，绝不回显工具标记
+    session(sessionListeners, sid, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
   } })
   const ws = makeWs()
   const bridge = new SessionBridge(ctx, { preset: 'standard', replyMode: 'stream' })
