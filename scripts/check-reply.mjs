@@ -57,7 +57,7 @@ function makeWs() {
       return {
         append: (delta) => { buf += delta; deltas.push(delta) },
         reset: (content) => { buf = content; if (content) deltas.push(content) },
-        keepAlive: () => { if (!buf) push(placeholder, false) },
+        keepAlive: () => { push(buf || placeholder, false) },
         finish: (finalText) => push(pickFinal(buf, finalText), true),
         get pushed() { return true },
       }
@@ -176,6 +176,32 @@ async function run(replyMode, onTurn) {
   assert.equal(ws.frames.length, 2)
   assert.match(ws.frames[1].content, /llm down/)
   assert.equal(ws.frames[1].finish, true)
+}
+
+// 6. 带工具调用的回合（复现「思考可见、工具调用后答案不出」）：
+//    思考实时可见 → 工具调用有「正在调用」标记 → 工具之后的答案仍能完整流式到达
+{
+  const ctx = makeCtx({ onTurn: (sid, { streamListeners, sessionListeners, agent }) => {
+    stream(streamListeners, agent, { type: 'start', turn: 1 })
+    stream(streamListeners, agent, { type: 'chunk', turn: 1, chunk: { type: 'reasoning-delta', text: '我需要查一下' } })
+    // 第一段 attempt：仅产出工具调用（committed + assistant/attempt，无用户消息）
+    stream(streamListeners, agent, { type: 'chunk', turn: 1, chunk: { type: 'tool-call-delta', id: 'c1', name: 'web_search', argumentsDelta: '{}' } })
+    stream(streamListeners, agent, { type: 'end', turn: 1, outcome: { kind: 'committed', eventType: 'assistant/attempt', seq: 1 } })
+    // 工具返回后第二段：继续思考 + 最终答案
+    stream(streamListeners, agent, { type: 'chunk', turn: 1, chunk: { type: 'reasoning-delta', text: '查到了' } })
+    stream(streamListeners, agent, { type: 'chunk', turn: 1, chunk: { type: 'text-delta', text: '前5名是' } })
+    stream(streamListeners, agent, { type: 'chunk', turn: 1, chunk: { type: 'text-delta', text: '上海北京江苏浙江福建' } })
+    session(sessionListeners, sid, { type: 'assistant/message', data: { turn: 1, message: { content: [{ type: 'text', text: '前5名是上海北京江苏浙江福建' }] } } })
+    stream(streamListeners, agent, { type: 'end', turn: 1, outcome: { kind: 'committed', eventType: 'assistant/message', seq: 2 } })
+  } })
+  const ws = makeWs()
+  const bridge = new SessionBridge(ctx, { preset: 'standard', replyMode: 'stream' })
+  bridge.handle(packet('m-tool', '查人均GDP前五'), ws)
+  for (let i = 0; i < 50 && !ws.frames.some((f) => f.finish); i++) await new Promise((r) => setTimeout(r, 10))
+  await bridge.dispose()
+  assert.ok(ws.deltas.some((d) => d.includes('正在调用工具：web_search')), `工具调用应有可见标记：deltas=${JSON.stringify(ws.deltas)}`)
+  assert.equal(ws.frames[ws.frames.length - 1].content, '前5名是上海北京江苏浙江福建', '工具之后的答案应完整流式到达')
+  assert.equal(ws.frames[ws.frames.length - 1].finish, true)
 }
 
 console.log('check-reply: OK')

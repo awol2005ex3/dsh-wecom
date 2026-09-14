@@ -44,6 +44,8 @@ interface ActiveTurn {
   cleanText: string
   /** 是否已进入 text-delta（答案）阶段——进入后丢弃思考文本。 */
   answering: boolean
+  /** 本轮已展示过「正在调用工具」标记的工具名（避免重复刷）。 */
+  toolCallsShown: Set<string>
   settled: boolean
   resolve: () => void
   timer: ReturnType<typeof setTimeout>
@@ -314,7 +316,7 @@ export class SessionBridge {
         const at: ActiveTurn = {
           responder, streamMode, agent: handle.agent,
           nText: 0, nReason: 0,
-          cleanText: '', answering: false,
+          cleanText: '', answering: false, toolCallsShown: new Set(),
           settled: false, resolve,
           timer: setTimeout(() => {
             if (at.settled) return
@@ -385,7 +387,7 @@ export class SessionBridge {
         at.nText++
         if (!at.answering) {
           at.answering = true
-          // 进入答案：清空已展示的推理文本，并直接以本帧答案开头重新流式，
+          // 进入答案：清空已展示的推理文本（含「正在调用工具」标记），从答案开头重新流式，
           // 避免「先发空帧再补答案」的闪烁，也避免推理+答案重复堆砌
           if (at.streamMode) at.responder.reset(chunk.text)
         } else if (at.streamMode) {
@@ -393,7 +395,17 @@ export class SessionBridge {
         }
         return
       }
-      // block-start / block-end / usage / finish / tool-call-delta 等不携带用户可见文本，忽略
+      if (chunk?.type === 'tool-call-delta') {
+        // 工具调用可见标记：长工具执行间隙用户至少能看到「正在调用 XX…」，
+        // 避免「思考出了一截、调工具后整条流像卡死」的观感；答案到达后由 reset 整体替换。
+        const toolName = chunk.name
+        if (at.streamMode && toolName && !at.toolCallsShown.has(toolName)) {
+          at.toolCallsShown.add(toolName)
+          at.responder.append(`\n⏳ 正在调用工具：${toolName}…\n`)
+        }
+        return
+      }
+      // block-start / block-end / usage / finish 等不携带用户可见文本，忽略
       return
     }
     if (frame.type === 'end') {
@@ -414,7 +426,7 @@ export class SessionBridge {
       clearTimeout(at.timer)
       clearInterval(at.heartbeat)
       this.activeTurns.delete(String(agent.session.id))
-      debugLog(`[turn] sid=${String(agent.session.id)} mode=${at.streamMode} text=${at.nText} reason=${at.nReason} outcome=${outcome?.kind}/${outcome?.eventType}`)
+      debugLog(`[turn] sid=${String(agent.session.id)} mode=${at.streamMode} text=${at.nText} reason=${at.nReason} outcome=${outcome?.kind}/${outcome?.eventType} clean=${at.cleanText.length}`)
       // 优先用干净终稿（assistant/message）；未带则 finish 用内部已流式 buf 兜底
       at.responder.finish(at.cleanText)
       at.resolve()
@@ -441,7 +453,7 @@ export class SessionBridge {
         clearTimeout(at.timer)
         clearInterval(at.heartbeat)
         this.activeTurns.delete(String(session.id))
-        debugLog(`[turn] ERROR sid=${String(session.id)} msg=${reason.error?.message ?? 'agent turn failed'}`)
+        debugLog(`[turn] ERROR sid=${String(session.id)} msg=${reason.error?.message ?? 'agent turn failed'} clean=${at.cleanText.length}`)
         at.responder.finish(`处理失败：${reason.error?.message ?? 'agent turn failed'}`)
         at.resolve()
         return
@@ -452,7 +464,7 @@ export class SessionBridge {
       clearTimeout(at.timer)
       clearInterval(at.heartbeat)
       this.activeTurns.delete(String(session.id))
-      debugLog(`[turn] END sid=${String(session.id)} reason=${reason?.kind} 兜底收尾`)
+      debugLog(`[turn] END sid=${String(session.id)} reason=${reason?.kind} 兜底收尾 clean=${at.cleanText.length}`)
       at.responder.finish(at.cleanText)  // 未带 cleanText 时 finish 用内部已流式 buf 兜底
       at.resolve()
     }

@@ -269,15 +269,17 @@ export class WsClient extends EventEmitter {
         this.sendStreamChunk(reqId, streamId, buf, false)
       },
       /**
-       * 保活：长空窗（推理模型思考初期、工具调用执行中）没有任何 chunk 时，
-       * 重发占位帧，避免用户在企微端看到“… ”一直转且最终因超时被丢弃。
-       * 一旦 append 过真实内容（buf 非空）就不再覆盖，避免冲掉已流式的内容。
+       * 保活：长空窗（推理模型思考初期、工具调用执行中）没有任何新 chunk 的间隙。
+       * 关键修复：无论 buf 是否为空都重发「当前内容」（空时退化为占位帧）。
+       * 重发的是同一份内容，企微只会保持该流式消息、不会有任何视觉变化，
+       * 但能防止流在「已流出思考内容、随后卡在工具调用几十秒~几分钟」的空闲期里
+       * 被企微空闲超时掐断——否则工具调用之后的答案帧会全部被丢弃
+       * （表现为「思考过程能看到、工具调用后什么都不出」）。
        */
       keepAlive: () => {
-        if (!buf) {
-          this.sendStreamChunk(reqId, streamId, placeholder, false)
-          lastPush = Date.now()
-        }
+        const content = buf || placeholder
+        this.sendStreamChunk(reqId, streamId, content, false)
+        lastPush = Date.now()
       },
       /**
        * 结束流式：content 为全量内容。
