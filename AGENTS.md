@@ -75,7 +75,8 @@ npx @deepseek-ai/dsh plugin --profile web add .   # 链接进 web profile
     - `ensureAgent` 的五级自愈：缓存 → `ctx.agents.get(sid)` **借用**（包 `dispose` 为空的伪 handle，标 `owned:false` 不释放）→ `create` → 撞车后**再借一次** → **同 id 重试一次**（瞬时竞争）→ 仍失败则用 `${sessionId}#${Date.now()}` 开新会话。任何一步都不要抛给用户在企微里看到「处理失败」。
     - 定位手段：冲突时会打 `wecom: create session <id> 冲突（...）；诊断: agent=... session=... sessions服务=... 存活会话=N`。`sessions服务=false` 说明当前 ctx 拿不到 session store（隔离 scope 问题）；`session=true` 说明会话残留且无 agent。SessionStore **没有公开删除接口**（`detachEntered` 是私有的），残留会话只能绕开、不能清理。
 
-13. **流式必须同时转发 `text-delta` 与 `reasoning-delta`。** 推理模型（R1 / thinking）的流式几乎全是 `reasoning-delta`，若 `runTurn` 只处理 `text-delta`，思考阶段一帧都不发，长思考会直接打满企微 10 分钟流式上限、用户看到「等全部思考完才输出」。`runTurn` 的处理：`reasoning-delta` 先累积进直播内容（实时可见），遇到首个 `text-delta` 时清空思考文本、只流式答案；`turn/end` 收尾优先用 `assistant/message` 的干净答案。另设 `KEEPALIVE_MS=4s` 心跳，长空窗（思考初期 / 工具调用执行中）无 chunk 时重发占位帧保活（`buf` 非空后自动停，不覆盖已流式内容）。`StreamChunk` 类型见 `@deepseek-ai/dsh-llm`：`text-delta` / `reasoning-delta` / `tool-call-delta` / `block-start` / `block-end` / `usage` / `error` / `aborted`。
+13. **流式必须同时转发 `text-delta` 与 `reasoning-delta`，且增量只能来自 `agent/assistant-stream`。** 推理模型（Qwen3-thinking / R1 等）的流式几乎全是 `reasoning-delta`，若 `onAgentStream` 只处理 `text-delta`，思考阶段一帧都不发，长思考会直接打满企微 10 分钟流式上限、用户看到「等全部思考完才输出」。**关键事实：`session/event` 总线在生产代码中【从不】携带增量 chunk**（只有 `assistant/message` 终稿与 `turn/end`），实时流必须监听 `agent/assistant-stream`（`payload.frame.chunk.type`）。** `onAgentStream` 的处理：`reasoning-delta` 先累积进直播内容（实时可见），遇到首个 `text-delta` 时清空思考文本、只流式答案；`end` 帧收尾优先用 `assistant/message` 的干净答案。另设 `KEEPALIVE_MS=4s` 心跳，长空窗（思考初期 / 工具调用执行中）无 chunk 时重发占位帧保活（`buf` 非空后自动停，不覆盖已流式内容）。`StreamChunk` 类型见 `@deepseek-ai/dsh-llm`：`text-delta` / `reasoning-delta` / `tool-call-delta` / `block-start` / `block-end` / `usage` / `error` / `aborted`。
+   **两个已踩的致命坑（改流式前必读）：** ① **绝不要用 `frame.turn` 过滤**——生产帧 `frame.turn` 恒为 `undefined`，且 `start` 帧不一定到达；一旦写 `if (frame.turn !== targetTurn) return` 这类守卫，所有增量帧与成功 `end` 帧都被静默丢弃，表现就是「选了流式也看不到思考、只剩终稿」。直接按 `payload.agent === agent` 过滤即可。② **`WsClient.append` 是增量累加（`buf += delta` 后发全量），转发时传单块 `chunk.text`，不要传自己累积的全量（会双重叠加成巨型内容）；思考切答案用 `responder.reset(content)` 整段替换，而非继续 append。**
 
 ---
 
@@ -119,15 +120,37 @@ handle.agent.followup(createUserMessage({
 
 ### 会话事件监听
 
+真实环境里**有两个独立通道**，别混淆：
+
 ```ts
-// session/event 是全局 durable 事件流
+// ① session/event：全局 durable 事件流，【只】承载「耐久」事件，从不携带增量 chunk
 ctx.on('session/event', (session: Session, event: SessionEvent) => {
   if (session.id !== targetSessionId) return
   switch (event.type) {
-    case 'turn/start': { /* event.data.turn */ }
-    case 'assistant/chunk': { /* event.data.chunk.type === 'text-delta' → { text } */ }
-    case 'assistant/message': { /* event.data.message.content: ContentBlock[] → extractText */ }
-    case 'turn/end': { /* event.data.reason: TurnEndReason */ }
+    case 'assistant/message': { /* event.data.message.content: ContentBlock[] → extractText，干净终稿 */ }
+    case 'turn/end': { /* event.data.reason: TurnEndReason（reason.kind === 'error' 时带错误原因） */ }
+    // 注意：'assistant/chunk' 在生产代码中【零 emit 点】，本插件不要依赖它拿增量
+  }
+})
+
+// ② agent/assistant-stream：真正的「实时增量」通道（reasoning-delta / text-delta / block-* / usage）
+// cordis 事件为全局广播（挂在任意 ctx 都能收到），但必须按 payload.agent 对象引用过滤到本会话的 agent。
+// 由 packages/core/agent-loop/src/agent.ts 经 AssistantStreamAttempt 发出，frame 结构见下。
+ctx.on('agent/assistant-stream', (payload: { agent: Agent; frame: any }) => {
+  if (payload.agent !== targetAgent) return
+  const frame = payload.frame
+  if (frame.type === 'start') { /* frame.turn */ }
+  else if (frame.type === 'chunk') {
+    // frame.chunk.type: 'reasoning-delta' | 'text-delta' | 'block-start' | 'block-end' | 'usage' | 'finish'
+    if (frame.chunk.type === 'reasoning-delta') { /* 思考过程，实时可见 */ }
+    if (frame.chunk.type === 'text-delta') { /* 答案增量 */ }
+  }
+  else if (frame.type === 'end') {
+    // frame.outcome.kind: 'committed'（成功/失败都可能是它）或 'abandoned'
+    //   committed 且 eventType === 'assistant/message' → 成功产出用户消息（收尾用 cleanText）
+    //   committed 且 eventType === 'assistant/attempt' → 本次尝试未产出消息（★真实 LLM 失败路径★）
+    //   abandoned → 持久化 append 失败（罕见）
+    // 见 src/bridge.ts 的 onAgentStream：遇到「无用户消息」的 end 帧必须 defer 给 turn/end 错误分支
   }
 })
 ```
@@ -212,7 +235,7 @@ const mediaId = await media.upload(filePath, 'image' | 'file')
 
 1. **`@cordisjs/core` → `@deepseek-ai/cordis`**：方案文档写 `@cordisjs/core`，实际 DSH 使用 `@deepseek-ai/cordis` + `@deepseek-ai/schemastery`。不更正则 tsc 找不到 `Schema` 导出。
 
-2. **`ctx.session.stream / send` 不存在**：真实 DSH 中 Agent 调用是 `ctx.agents.create()` + `followup()` + 事件驱动。回复需通过 `session/event` 监听 `assistant/chunk` / `assistant/message` 获取。
+2. **`ctx.session.stream / send` 不存在**：真实 DSH 中 Agent 调用是 `ctx.agents.create()` + `followup()` + 事件驱动。回复的**实时增量**通过 `agent/assistant-stream` 监听（`payload.frame.chunk.type` 为 `text-delta` / `reasoning-delta` 等）；`session/event` 总线只承载耐久事件（`assistant/message` 干净终稿、`turn/end` 错误），**不**携带增量 chunk（不要依赖 `assistant/chunk`，生产零 emit）。详见约定 13。
 
 3. **`ctx.http` 不存在**：DSH 无 axios 等 HTTP 客户端注入。使用 Node 全局 `fetch`（>=22）发 HTTP 请求。
 

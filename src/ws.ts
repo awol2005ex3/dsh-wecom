@@ -258,6 +258,17 @@ export class WsClient extends EventEmitter {
         }
       },
       /**
+       * 整段替换当前已展示内容（不增量）。用于「思考阶段→答案阶段」切换：
+       * 答案首帧先把已展示的推理文本清空，从答案开头重新流式，避免推理+答案重复堆砌。
+       * 立即发送（不受 500ms 节流约束），保证切换可见。
+       */
+      reset: (content: string) => {
+        buf = content
+        lastPush = Date.now()
+        pushed = true
+        this.sendStreamChunk(reqId, streamId, buf, false)
+      },
+      /**
        * 保活：长空窗（推理模型思考初期、工具调用执行中）没有任何 chunk 时，
        * 重发占位帧，避免用户在企微端看到“… ”一直转且最终因超时被丢弃。
        * 一旦 append 过真实内容（buf 非空）就不再覆盖，避免冲掉已流式的内容。

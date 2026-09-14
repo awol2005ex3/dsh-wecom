@@ -36,15 +36,14 @@ export type StreamResponder = ReturnType<WsClient['createStreamResponder']>
 interface ActiveTurn {
   responder: StreamResponder
   streamMode: boolean
-  /** 本回合的 turn 编号（收到 turn/start 时记录，用于过滤旧回合事件）。 */
-  targetTurn: number | null
+  /** 该回合归属的 agent（用于按 agent 过滤 `agent/assistant-stream`）。 */
+  agent: Agent
   nText: number
   nReason: number
-  texts: string[]
+  /** 干净终稿（来自 `assistant/message`），收尾时优先于已流式的 buf。 */
+  cleanText: string
   /** 是否已进入 text-delta（答案）阶段——进入后丢弃思考文本。 */
   answering: boolean
-  /** 当前已流式发送到企微的内容：思考阶段=推理文本，回答阶段=答案文本。 */
-  liveBuf: string
   settled: boolean
   resolve: () => void
   timer: ReturnType<typeof setTimeout>
@@ -85,6 +84,8 @@ export class SessionBridge {
   private activeTurns = new Map<string, ActiveTurn>()
   /** 已注册 session/event 监听的 agent ctx（按对象去重，避免重复注册）。 */
   private sessionListeners = new WeakSet<object>()
+  /** 已注册 agent/assistant-stream 监听的 agent（按对象去重）。 */
+  private agentStreams = new WeakSet<object>()
 
   constructor(private ctx: Context, private cfg: any) {
     this.media = new MediaHandler({
@@ -297,30 +298,36 @@ export class SessionBridge {
         return
     }
 
-    // 2. 取/建 agent，并在其 carrier 作用域注册 session/event 监听（核心修复），
-    //    随后把本回合的转发器写入 activeTurns，跟随该 session 的生命周期事件转发到企微。
+    // 2. 取/建 agent，注册两类监听：
+    //    - `agent/assistant-stream`：真正的实时增量通道（reasoning-delta / text-delta）。
+    //      `session/event` 总线【从不】携带增量块，只有回合结束的 assistant/message。
+    //    - `session/event`：仅用于干净终稿（assistant/message）与回合错误（turn/end）。
     try {
       const handle = await this.ensureAgent(sessionId)
-      this.registerSessionListener((handle.agent as any).ctx)  // 借用场景兜底（create 已在 setup 注册）
+      this.registerAgentStream(handle.agent)                  // 实时流式通道
+      this.registerSessionListener((handle.agent as any).ctx) // 终稿 + 错误兜底
       const sid = String(handle.agent.session.id)
       const streamMode = this.cfg.replyMode === 'stream'
+      debugLog(`[proc] sessionId=${sessionId} sid=${sid} streamMode=${streamMode}`)
 
       const turn = new Promise<void>((resolve) => {
         const at: ActiveTurn = {
-          responder, streamMode,
-          targetTurn: null, nText: 0, nReason: 0,
-          texts: [], answering: false, liveBuf: '',
+          responder, streamMode, agent: handle.agent,
+          nText: 0, nReason: 0,
+          cleanText: '', answering: false,
           settled: false, resolve,
           timer: setTimeout(() => {
             if (at.settled) return
             at.settled = true
             clearInterval(at.heartbeat)
             this.activeTurns.delete(sid)
-            debugLog(`[turn] TIMEOUT sid=${sid} mode=${streamMode} textDelta=${at.nText} reasonDelta=${at.nReason}`)
-            at.responder.finish('处理超时，请稍后再试')
+            debugLog(`[turn] TIMEOUT sid=${sid} mode=${streamMode} text=${at.nText} reason=${at.nReason}`)
+            at.responder.finish(at.cleanText || '处理超时，请稍后再试')
             resolve()
           }, TURN_TIMEOUT_MS),
           heartbeat: setInterval(() => {
+            // 长空窗保活：keepAlive 内部仅在自身 buf 为空（尚未流出任何内容）时重发占位帧，
+            // 一旦 append/reset 过真实内容就自动停，不会覆盖已流式内容。
             if (!at.settled) at.responder.keepAlive()
           }, KEEPALIVE_MS),
         }
@@ -338,65 +345,115 @@ export class SessionBridge {
     }
   }
 
-  /** 在 agent 的 carrier 作用域（agentCtx）注册 session/event 监听，同一 ctx 只注册一次。 */
+  /** 注册 `session/event` 监听（全局总线，同一 ctx 只注册一次），用于干净终稿与回合错误。 */
   private registerSessionListener(agentCtx: Context | undefined) {
     if (!agentCtx || this.sessionListeners.has(agentCtx)) return
     this.sessionListeners.add(agentCtx)
     agentCtx.on('session/event', (session: any, event: any) => this.onSessionEvent(session, event))
   }
 
-  /**
-   * session/event 总线回调（监听挂在 agent 的 carrier 作用域上，故能收到该 session 的事件）。
-   * 根据 session.id 找到当前活跃回合转发器，把增量 / 消息 / 结束事件转发给企微。
-   */
-  private onSessionEvent(session: any, event: any) {
-    const at = this.activeTurns.get(String(session.id))
+  /** 注册 `agent/assistant-stream` 监听（全局总线，按 agent 过滤），用于实时流式增量。 */
+  private registerAgentStream(agent: Agent) {
+    if (this.agentStreams.has(agent as unknown as object)) return
+    this.agentStreams.add(agent as unknown as object)
+    ;(this.ctx as any).on('agent/assistant-stream', (payload: any) => {
+      if (payload?.agent !== agent) return
+      this.onAgentStream(agent, payload.frame)
+    })
+  }
+
+  /** `agent/assistant-stream` 回调：把逐块增量实时转发到企微流式消息（含思考过程）。 */
+  private onAgentStream(agent: Agent, frame: any) {
+    const at = this.activeTurns.get(String(agent.session.id))
     if (!at || at.settled) return
-    const sid = String(session.id)
+    debugLog(`[astream] type=${frame?.type} turn=${frame?.turn} chunk=${frame?.chunk?.type ?? ''}`)
 
-    if (event.type === 'turn/start') {
-      if (at.targetTurn === null) at.targetTurn = event.data.turn
-      return
-    }
-    if (at.targetTurn === null) return
+    // 注：harness 生产帧的 frame.turn 恒为 undefined，且 start 帧不一定到达本监听器，
+    // 故【不】依赖 turn 编号做过滤——已按 payload.agent === agent 精确匹配，
+    // 且每会话串行（queue），同一时刻仅一个活跃回合，无需 turn 维度去重。
+    if (frame.type === 'start') return  // 仅占位标记，不做任何依赖
 
-    if (at.streamMode
-      && event.type === 'assistant/chunk'
-      && event.data.turn === at.targetTurn) {
-      const chunk = event.data.chunk
+    if (frame.type === 'chunk') {
+      const chunk = frame.chunk
+      if (chunk?.type === 'reasoning-delta') {
+        at.nReason++
+        // 思考过程实时可见：逐 delta 增量推送（responder.append 内部已累积并节流）
+        if (!at.answering && at.streamMode) at.responder.append(chunk.text)
+        return
+      }
       if (chunk?.type === 'text-delta') {
         at.nText++
-        if (!at.answering) { at.answering = true; at.liveBuf = '' }  // 进入答案：丢弃思考文本，仅流式答案
-        at.liveBuf += chunk.text
-        at.responder.append(at.liveBuf)
+        if (!at.answering) {
+          at.answering = true
+          // 进入答案：清空已展示的推理文本，并直接以本帧答案开头重新流式，
+          // 避免「先发空帧再补答案」的闪烁，也避免推理+答案重复堆砌
+          if (at.streamMode) at.responder.reset(chunk.text)
+        } else if (at.streamMode) {
+          at.responder.append(chunk.text)
+        }
         return
       }
-      if (chunk?.type === 'reasoning-delta' && !at.answering) {
-        at.nReason++
-        at.liveBuf += chunk.text
-        at.responder.append(at.liveBuf)
-        return
-      }
-    }
-    if (event.type === 'assistant/message' && event.data.turn === at.targetTurn) {
-      const text = extractText(event.data.message.content)
-      if (text) at.texts.push(text)
+      // block-start / block-end / usage / finish / tool-call-delta 等不携带用户可见文本，忽略
       return
     }
-    if (event.type === 'turn/end' && event.data.turn === at.targetTurn) {
+    if (frame.type === 'end') {
+      const outcome = frame.outcome
+      // 失败 / 中断 / 持久化异常：本次尝试未产出可交付给用户的最终消息
+      // （outcome.kind === 'abandoned'，或 committed 但 eventType 为 'assistant/attempt'），
+      // 不应以当前 buf 收尾，交由 session/event 的 turn/end 错误分支给出文案。
+      // 注意：真实 LLM 失败走的是「committed + assistant/attempt」而非 abandoned——
+      // harness 会先提交这次（可能部分的）尝试，再 throw，最终由 turn/end 携带错误原因。
+      const noUserMessage =
+        outcome?.kind === 'abandoned' ||
+        (outcome?.kind === 'committed' && outcome.eventType !== 'assistant/message')
+      if (noUserMessage) {
+        debugLog(`[turn] sid=${String(agent.session.id)} outcome=${outcome?.kind}/${outcome?.eventType} 无用户消息，等待 turn/end 错误分支`)
+        return
+      }
       at.settled = true
       clearTimeout(at.timer)
       clearInterval(at.heartbeat)
-      this.activeTurns.delete(sid)
-      debugLog(`[turn] sid=${sid} mode=${at.streamMode} textDelta=${at.nText} reasonDelta=${at.nReason} msgLen=${at.texts.join('').length}`)
+      this.activeTurns.delete(String(agent.session.id))
+      debugLog(`[turn] sid=${String(agent.session.id)} mode=${at.streamMode} text=${at.nText} reason=${at.nReason} outcome=${outcome?.kind}/${outcome?.eventType}`)
+      // 优先用干净终稿（assistant/message）；未带则 finish 用内部已流式 buf 兜底
+      at.responder.finish(at.cleanText)
+      at.resolve()
+    }
+  }
+
+  /**
+   * session/event 总线回调：只处理干净终稿（assistant/message）与回合错误（turn/end）。
+   * 注意：该总线【不】携带增量块，实时流式由 `agent/assistant-stream` 驱动。
+   */
+  private onSessionEvent(session: any, event: any) {
+    const at = this.activeTurns.get(String(session?.id))
+    if (!at || at.settled) return
+
+    if (event.type === 'assistant/message') {
+      const text = extractText(event.data.message.content)
+      if (text) at.cleanText = text  // 干净终稿，收尾时优先于已流式的 buf
+      return
+    }
+    if (event.type === 'turn/end') {
       const reason = event.data.reason
-      if (reason.kind === 'error') {
-        // 占位帧已经发过，必须用 finish 收尾（错误文案替换占位），不能再走一次性 markdown
+      if (reason?.kind === 'error') {
+        at.settled = true
+        clearTimeout(at.timer)
+        clearInterval(at.heartbeat)
+        this.activeTurns.delete(String(session.id))
+        debugLog(`[turn] ERROR sid=${String(session.id)} msg=${reason.error?.message ?? 'agent turn failed'}`)
         at.responder.finish(`处理失败：${reason.error?.message ?? 'agent turn failed'}`)
-      } else {
-        // 优先用 assistant/message 的干净答案；拿不到时回退到流式累积内容
-        at.responder.finish(at.texts.length ? at.texts[at.texts.length - 1] : at.liveBuf)
+        at.resolve()
+        return
       }
+      // 非错误收尾（如被取消 / 本次尝试被 defer 后没再产生消息）：以当前已有内容兜底，不无限挂起
+      if (at.settled) return
+      at.settled = true
+      clearTimeout(at.timer)
+      clearInterval(at.heartbeat)
+      this.activeTurns.delete(String(session.id))
+      debugLog(`[turn] END sid=${String(session.id)} reason=${reason?.kind} 兜底收尾`)
+      at.responder.finish(at.cleanText)  // 未带 cleanText 时 finish 用内部已流式 buf 兜底
       at.resolve()
     }
   }
