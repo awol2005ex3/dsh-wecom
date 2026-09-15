@@ -9,3 +9,4 @@ lib/
 .workbuddy/
 .agents
 .merkle-snapshot.json
+.arts

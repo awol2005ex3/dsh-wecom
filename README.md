@@ -2,6 +2,8 @@
 
 DeepSeek Harness（dsh）企业微信智能机器人插件。通过企微"智能机器人"API 模式下的**长连接**（WebSocket）接入，将 WeCom 消息对接到 DSH Agent。
 
+![截图1](docs/截图1.png)
+![截图2](docs/截图2.png)
 ## 功能
 
 | 模块 | 里程碑 | 状态 |
