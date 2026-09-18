@@ -13,6 +13,13 @@ const STREAM_THROTTLE_MS    = 500      // 流式推送节流
 const STREAM_PLACEHOLDER    = '思考中…'
 /** 流式消息既没累积内容也没给终结文案时的兜底。 */
 const EMPTY_REPLY           = '（本次没有生成回复内容）'
+/**
+ * 心跳空闲阈值：距上次增量超过此值（工具执行 / 思考空窗），心跳才叠加旋转状态行。
+ * 活跃流式期间（空窗短）只重发内容、不加状态行，避免每 4s 抖动一次。
+ */
+const STATUS_GAP_MS         = 2_500
+/** 状态行动画帧（braille spinner）：让用户明确看到「流仍活着、在运行中」，而非「断了」。 */
+const STREAM_STATUS_SPIN    = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
 /**
  * req_id 生成：带命令前缀。无 cmd 的服务端回执（订阅响应/心跳响应）
@@ -269,6 +276,18 @@ export class WsClient extends EventEmitter {
     let buf = ''
     let lastPush = 0
     let pushed = false
+    let status: string | null = null      // 瞬时状态行（思考中/正在调用工具/整理回复中）；收尾时自动剥离
+    let lastChunkTs = Date.now()          // 最近一次增量时刻，用于判断「空闲空窗」是否该显示状态
+    let statusLastSent = 0
+    let spin = 0
+    const statusLine = () => `\n\n${STREAM_STATUS_SPIN[spin++ % STREAM_STATUS_SPIN.length]} ${status}`
+    /** 发送当前内容；withStatus 为真且已设置状态行时，追加带旋转动画的状态行（让用户看到「仍在运行」）。 */
+    const sendContent = (withStatus: boolean) => {
+      const content = buf || placeholder
+      const line = withStatus && status ? statusLine() : ''
+      this.sendStreamChunk(reqId, streamId, content + line, false)
+      lastPush = Date.now()
+    }
     if (this.sendStreamChunk(reqId, streamId, placeholder, false)) {
       pushed = true
       lastPush = Date.now()
@@ -278,11 +297,12 @@ export class WsClient extends EventEmitter {
     return {
       append: (delta: string) => {
         buf += delta
+        lastChunkTs = Date.now()
         const now = Date.now()
         if (now - lastPush >= STREAM_THROTTLE_MS) {
           lastPush = now
           pushed = true
-          this.sendStreamChunk(reqId, streamId, buf, false)
+          sendContent(false)
         }
       },
       /**
@@ -292,27 +312,34 @@ export class WsClient extends EventEmitter {
        */
       reset: (content: string) => {
         buf = content
-        lastPush = Date.now()
-        pushed = true
-        this.sendStreamChunk(reqId, streamId, buf, false)
+        lastChunkTs = Date.now()
+        sendContent(false)
       },
       /**
-       * 保活：长空窗（推理模型思考初期、工具调用执行中）没有任何新 chunk 的间隙。
-       * 关键修复：无论 buf 是否为空都重发「当前内容」（空时退化为占位帧）。
-       * 重发的是同一份内容，企微只会保持该流式消息、不会有任何视觉变化，
-       * 但能防止流在「已流出思考内容、随后卡在工具调用几十秒~几分钟」的空闲期里
-       * 被企微空闲超时掐断——否则工具调用之后的答案帧会全部被丢弃
-       * （表现为「思考过程能看到、工具调用后什么都不出」）。
+       * 设置瞬时状态行（如「⏳ 正在调用工具：xxx」）。仅在文本变化时调用（bridge 已去重），
+       * 立即重发「当前内容 + 状态行」让用户看到阶段切换；空字符串清除状态。
+       * 这是「运行中」可见性的核心：工具执行几十秒~几分钟的空窗里，用户能看到状态在旋转而非「断了」。
        */
-      keepAlive: () => {
-        const content = buf || placeholder
-        this.sendStreamChunk(reqId, streamId, content, false)
-        lastPush = Date.now()
+      setStatus: (text: string | null) => {
+        status = text
+        const now = Date.now()
+        if (now - statusLastSent < STREAM_THROTTLE_MS) return
+        statusLastSent = now
+        sendContent(true)
+      },
+      /**
+       * 心跳保活（每 KEEPALIVE_MS 调用）：重发当前内容防企微空闲超时掐断。
+       * 若距上次增量已超过 STATUS_GAP_MS（工具执行/思考空窗），叠加带旋转动画的状态行，
+       * 让用户明确看到「仍在运行中」而非「断了」；活跃增量期间（空窗短）只重发内容、不加状态行避免抖动。
+       */
+      tick: () => {
+        const idle = Date.now() - lastChunkTs
+        sendContent(idle >= STATUS_GAP_MS)
       },
       /**
        * 结束流式：content 为全量内容。
        * 显式给了 finalText 就用它（回合结果 / 错误文案 / 超时提示优先），
-       * 否则退回累积的 buf，都为空时给一句兜底文案。
+       * 否则退回累积的 buf，都为空时给一句兜底文案。状态行自动剥离，干净收尾。
        */
       finish: (finalText?: string) => this.sendStreamChunk(reqId, streamId, pickFinal(buf, finalText), true),
       /** 当前已累积并展示的内容（收尾转主动推送时取此作为终稿）。 */

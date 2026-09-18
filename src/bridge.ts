@@ -72,6 +72,10 @@ interface ActiveTurn {
   target: WecomSendTarget
   /** 是否已发过「长任务提示」（避免重复推送）。 */
   hintSent: boolean
+  /** 当前展示阶段（驱动「运行中」状态行文案；按优先级不降级）。 */
+  phase: 'init' | 'thinking' | 'tool' | 'answering'
+  /** 当前状态行文案（去重，避免重复推送刷屏）。 */
+  statusText: string
   resolve: () => void
   /** 兜底硬超时定时器（agent 卡死时强制收尾）。 */
   hardTimer: ReturnType<typeof setTimeout>
@@ -369,7 +373,7 @@ export class SessionBridge {
           responder, ws, streamMode, agent: handle.agent,
           nText: 0, nReason: 0,
           cleanText: '', answering: false, toolCallsShown: new Set(),
-          settled: false, streamStartTs, target, hintSent: false, resolve,
+          settled: false, streamStartTs, target, hintSent: false, phase: 'init', statusText: '', resolve,
           // 兜底硬超时：agent 卡死时强制收尾，避免队列永久阻塞
           hardTimer: setTimeout(() => {
             if (at.settled) return
@@ -395,7 +399,7 @@ export class SessionBridge {
             if (at.settled) return
             // 流式消息已被企微强制结束（超过 10 分钟窗口）后，再发也无效，停掉省流量
             if (Date.now() - at.streamStartTs >= STREAM_MAX_MS) return
-            at.responder.keepAlive()
+            at.responder.tick()
           }, KEEPALIVE_MS),
         }
         activeAt = at
@@ -411,9 +415,9 @@ export class SessionBridge {
       debugLog(`[process] error: ${errorMessage(err)}`)
       // at 已建好则走统一收尾（会按耗时决定 finish / 主动推送），否则直接 finish 占位流
       if (activeAt && activeSid && !activeAt.settled) {
-        this.settleTurn(activeAt, activeSid, `处理失败：${errorChain(err)}`)
+        this.settleTurn(activeAt, activeSid, `⚠️ 处理失败：${errorChain(err)}`)
       } else {
-        responder.finish(`处理失败：${errorChain(err)}`)
+        responder.finish(`⚠️ 处理失败：${errorChain(err)}`)
       }
     }
   }
@@ -459,6 +463,8 @@ export class SessionBridge {
       at.nReason++
       // 思考过程实时可见：逐 delta 增量推送（responder.append 内部已累积并节流）
       if (!at.answering && at.streamMode) at.responder.append(chunk.text)
+      // 驱动「运行中」状态行：让用户看到「正在思考」而非「断了」
+      this.setPhase(at, 'thinking', '💭 正在思考…')
       return
     }
     if (chunk?.type === 'text-delta') {
@@ -468,6 +474,8 @@ export class SessionBridge {
         // 进入答案：清空已展示的推理文本（含「正在调用工具」标记），从答案开头重新流式，
         // 避免「先发空帧再补答案」的闪烁，也避免推理+答案重复堆砌
         if (at.streamMode) at.responder.reset(chunk.text)
+        // 阶段切到「整理回复」，状态行随之更新
+        this.setPhase(at, 'answering', '📝 正在整理回复…')
       } else if (at.streamMode) {
         at.responder.append(chunk.text)
       }
@@ -477,9 +485,11 @@ export class SessionBridge {
       // 工具调用可见标记：长工具执行间隙用户至少能看到「正在调用 XX…」，
       // 避免「思考出了一截、调工具后整条流像卡死」的观感；答案到达后由 reset 整体替换。
       const toolName = chunk.name
-      if (at.streamMode && toolName && !at.toolCallsShown.has(toolName)) {
+      if (toolName && !at.toolCallsShown.has(toolName)) {
         at.toolCallsShown.add(toolName)
-        at.responder.append(`\n⏳ 正在调用工具：${toolName}…\n`)
+        if (at.streamMode) at.responder.append(`\n⏳ 正在调用工具：${toolName}…\n`)
+        // 驱动「运行中」状态行：明确的「正在调用工具」提示，解决「以为断了其实在跑」
+        this.setPhase(at, 'tool', `⏳ 正在调用工具：${toolName}…`)
       }
       return
     }
@@ -502,7 +512,7 @@ export class SessionBridge {
     if (event.type === 'turn/end') {
       const reason = event.data.reason
       if (reason?.kind === 'error') {
-        this.settleTurn(at, String(session.id), `处理失败：${reason.error?.message ?? 'agent turn failed'}`)
+        this.settleTurn(at, String(session.id), `⚠️ 处理失败：${reason.error?.message ?? 'agent turn failed'}`)
         return
       }
       // 非错误收尾（completed / 被取消等）：以当前已有内容兜底收尾
@@ -536,6 +546,11 @@ export class SessionBridge {
     debugLog(`[turn] END sid=${sessionId} elapsed=${Math.round(elapsed / 1000)}s proactive=${proactive} clean=${at.cleanText.length}`)
 
     if (proactive) {
+      // 旧流式消息仍存活（未超 10 分钟窗口）：先干净收尾并明确告知「完整结论在下方新消息」，
+      // 避免残留半截内容像「断了」；已超窗口（企微已强制结束）时 finish 是空操作，无副作用。
+      if (elapsed < STREAM_MAX_MS) {
+        at.responder.finish('（任务较长，已超出对话流式消息时长上限；完整结论见下方新消息 ↓）')
+      }
       at.ws.sendProactiveMarkdown(at.target, content)
     } else {
       at.responder.finish(content)
@@ -562,5 +577,19 @@ export class SessionBridge {
       return `⚠️ 已调用工具（${[...at.toolCallsShown].join('、')}）但未返回文本结果，请稍后重试或更换问题。`
     }
     return '（本次未生成回复内容）'
+  }
+
+  /**
+   * 驱动「运行中」状态行：按优先级切换阶段文案（思考中 / 正在调用工具 / 整理回复中）。
+   * 仅在阶段升级或文案变化时调用 responder.setStatus，避免重复推送刷屏；
+   * 降级（如已「整理回复」不再退回「思考中」）直接忽略。
+   */
+  private setPhase(at: ActiveTurn, phase: ActiveTurn['phase'], text: string) {
+    const order: Record<ActiveTurn['phase'], number> = { init: 0, thinking: 1, tool: 2, answering: 3 }
+    if (order[phase] < order[at.phase]) return
+    if (at.statusText === text) return
+    at.phase = phase
+    at.statusText = text
+    at.responder.setStatus(text)
   }
 }

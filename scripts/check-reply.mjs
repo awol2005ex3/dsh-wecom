@@ -50,9 +50,10 @@ function makeCtx({ onTurn }) {
 function makeWs() {
   const frames = []
   const deltas = []
-  return {
-    frames,
-    deltas,
+  const statusSets = []
+  const ticks = []
+  const ws = {
+    frames, deltas, statusSets, ticks,
     createStreamResponder(reqId, placeholder = '思考中…') {
       let buf = ''
       const push = (content, finish) => { frames.push({ reqId, content, finish }); return true }
@@ -60,7 +61,8 @@ function makeWs() {
       return {
         append: (delta) => { buf += delta; deltas.push(delta) },
         reset: (content) => { buf = content; if (content) deltas.push(content) },
-        keepAlive: () => { push(buf || placeholder, false) },
+        setStatus: (text) => { statusSets.push(text) },
+        tick: () => { ticks.push(buf || placeholder) },
         finish: (finalText) => push(pickFinal(buf, finalText), true),
         get buffer() { return buf },
         get pushed() { return true },
@@ -71,6 +73,7 @@ function makeWs() {
     respondWelcome() {},
     createStreamResponderCalls: 0,
   }
+  return ws
 }
 
 function packet(msgid, text) {
@@ -260,8 +263,69 @@ async function run(replyMode, onTurn) {
   await bridge.dispose()
   const finalProactive = ws.frames.find((f) => f.proactive && f.content.includes('最终结论'))
   assert.ok(finalProactive, `长任务最终结论应经主动推送送达：${JSON.stringify(ws.frames)}`)
-  assert.ok(!ws.frames.some((f) => f.finish), '长任务不应原地 finish 已逝的流式消息（否则结论会被截断）')
+  // 关键：绝不可把完整结论「原地 finish」到已逝/濒死的流式消息（会被企微截断）。结论只走主动推送。
+  assert.ok(!ws.frames.some((f) => f.finish && f.content.includes('最终结论')), '长任务绝不应把结论原地 finish 到流式消息（否则会被截断）')
+  // 旧流式消息应被干净收尾（带「结论在下方新消息」交接提示），而非残留半截内容让用户误以为「断了」
+  const handoff = ws.frames.find((f) => f.finish)
+  assert.ok(handoff, '旧流式消息应被干净收尾（带交接提示）')
+  assert.ok(handoff.content.includes('下方新消息'), `旧流式消息应明确告知结论在下方新消息：${handoff.content}`)
   assert.ok(ws.frames.some((f) => f.proactive && f.content.includes('任务还在处理中')), '应发过一次长任务提示，告知用户结论将以新消息送达')
+}
+
+// 9. 「运行中」状态行：工具调用空窗期应驱动「正在调用工具」状态，且最终收尾内容不含瞬时状态行
+{
+  const ctx = makeCtx({ onTurn: (sid, { streamListeners, sessionListeners, agent }) => {
+    stream(streamListeners, agent, { type: 'start', turn: 1 })
+    stream(streamListeners, agent, { type: 'chunk', turn: 1, chunk: { type: 'reasoning-delta', text: '想想' } })
+    // 工具调用（进入「正在调用工具」状态），随后一长段空窗（模拟工具执行几十秒）
+    stream(streamListeners, agent, { type: 'chunk', turn: 1, chunk: { type: 'tool-call-delta', id: 'c1', name: 'web_search', argumentsDelta: '{}' } })
+    // 空窗后用真实定时器模拟工具执行耗时，再产出答案
+    setTimeout(() => {
+      stream(streamListeners, agent, { type: 'chunk', turn: 1, chunk: { type: 'text-delta', text: '结果是A' } })
+      session(sessionListeners, sid, { type: 'assistant/message', data: { turn: 1, message: { content: [{ type: 'text', text: '结果是A' }] } } })
+      stream(streamListeners, agent, { type: 'end', turn: 1, outcome: { kind: 'committed', eventType: 'assistant/message', seq: 1 } })
+      session(sessionListeners, sid, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    }, 30)
+  } })
+  const ws = makeWs()
+  const bridge = new SessionBridge(ctx, { preset: 'standard', replyMode: 'stream' })
+  bridge.handle(packet('m-status', '查一下'), ws)
+  for (let i = 0; i < 50 && !ws.frames.some((f) => f.finish); i++) await new Promise((r) => setTimeout(r, 10))
+  await bridge.dispose()
+  // 阶段驱动了状态行：至少出现过「思考中」与「正在调用工具」
+  assert.ok(ws.statusSets.some((s) => s && s.includes('正在思考')), `应驱动思考状态行：${ws.statusSets}`)
+  assert.ok(ws.statusSets.some((s) => s && s.includes('正在调用工具')), `应驱动工具状态行：${ws.statusSets}`)
+  // 最终收尾内容干净：不含瞬时状态行文案、不含旋转动画字符
+  const last = ws.frames[ws.frames.length - 1]
+  assert.equal(last.finish, true)
+  assert.ok(!last.content.includes('正在调用工具'), `收尾内容不应残留工具状态行：${last.content}`)
+  assert.ok(!/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(last.content), `收尾内容不应含旋转动画：${last.content}`)
+}
+
+// 10. responder 单元：状态行动画随 tick 旋转，且 finish 必须剥离状态行只留干净内容
+{
+  const { WsClient } = await import('../lib/ws.js')
+  const frames = []
+  const c = new WsClient({ botId: 'b', secret: 's' }, { info() {}, warn() {}, error() {} })
+  c.send = (p) => { frames.push(p); return true }   // 绕过 readyState 检查，直接捕获帧
+  const r = c.createStreamResponder('req-1')
+  r.append('hello')
+  r.setStatus('⏳ 正在调用工具：web_search…')
+  const frameA = frames[frames.length - 1]
+  assert.ok(frameA.body.stream.content.includes('⏳ 正在调用工具'), `setStatus 应发出带状态行的帧：${frameA.body.stream.content}`)
+  assert.ok(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(frameA.body.stream.content), '状态行应带旋转动画字符')
+  // 等待超过空闲阈值(2.5s)与节流窗口，让 tick 也叠加状态行，且旋转字符变化
+  await new Promise((res) => setTimeout(res, 3000))
+  r.tick()
+  const frameB = frames[frames.length - 1]
+  assert.ok(frameB.body.stream.content.includes('⏳ 正在调用工具'), '超过空闲阈值后 tick 应叠加状态行')
+  const spinA = frameA.body.stream.content.match(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/)[0]
+  const spinB = frameB.body.stream.content.match(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/)[0]
+  assert.notEqual(spinA, spinB, `旋转动画应随 tick 变化：${spinA} -> ${spinB}`)
+  r.finish('最终答案')
+  const fin = frames[frames.length - 1]
+  assert.equal(fin.body.stream.finish, true)
+  assert.equal(fin.body.stream.content, '最终答案', 'finish 必须剥离状态行，只留干净内容')
 }
 
 console.log('check-reply: OK')
