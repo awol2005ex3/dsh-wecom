@@ -43,6 +43,12 @@ export interface WecomCallbackPacket {
   errmsg?: string
 }
 
+/** 主动推送目标：单聊填 userid(chat_type=1)，群聊填群 chatid(chat_type=2)。 */
+export interface WecomSendTarget {
+  chatid: string
+  chatType: 1 | 2
+}
+
 export class WsClient extends EventEmitter {
   private ws?: WebSocket
   private retry = 0
@@ -228,6 +234,28 @@ export class WsClient extends EventEmitter {
   }
 
   /**
+   * 主动推送消息（aibot_send_msg）：不需要用户消息触发的 req_id，用于异步任务通知。
+   *
+   * 关键用途：企微流式消息从首帧起 10 分钟必须 finish，否则被强制结束。
+   * 对于超过该窗口的长任务，回合真正结束（turn/end）后无法再写入已死的流式消息，
+   * 必须用本方法把最终结论作为「一条新消息」主动推送给用户（前置条件：用户已在本会话发过消息）。
+   *
+   * 目标定位：单聊 chatid=用户 userid / chat_type=1；群聊 chatid=群 chatid / chat_type=2。
+   */
+  sendProactiveMarkdown(target: WecomSendTarget, content: string): boolean {
+    return this.send({
+      cmd: 'aibot_send_msg',
+      headers: { req_id: buildReqId('aibot_send_msg') },
+      body: {
+        chatid: target.chatid,
+        chat_type: target.chatType,
+        msgtype: 'markdown',
+        markdown: { content },
+      },
+    })
+  }
+
+  /**
    * 流式回复句柄：**创建即发出首帧占位**。
    *
    * 企微要求「收到消息回调后 5 秒内回复」，而 Agent 首个 token 通常远晚于此，
@@ -287,6 +315,10 @@ export class WsClient extends EventEmitter {
        * 否则退回累积的 buf，都为空时给一句兜底文案。
        */
       finish: (finalText?: string) => this.sendStreamChunk(reqId, streamId, pickFinal(buf, finalText), true),
+      /** 当前已累积并展示的内容（收尾转主动推送时取此作为终稿）。 */
+      get buffer(): string {
+        return buf
+      },
       /** 是否已推送过流式内容（用于错误收尾判断）。 */
       get pushed(): boolean {
         return pushed

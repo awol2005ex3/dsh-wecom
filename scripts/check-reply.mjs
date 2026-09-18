@@ -62,10 +62,12 @@ function makeWs() {
         reset: (content) => { buf = content; if (content) deltas.push(content) },
         keepAlive: () => { push(buf || placeholder, false) },
         finish: (finalText) => push(pickFinal(buf, finalText), true),
+        get buffer() { return buf },
         get pushed() { return true },
       }
     },
     respondMarkdown(reqId, content) { frames.push({ reqId, content, markdown: true, finish: true }) },
+    sendProactiveMarkdown(target, content) { frames.push({ proactive: true, target, content }) },
     respondWelcome() {},
     createStreamResponderCalls: 0,
   }
@@ -233,6 +235,33 @@ async function run(replyMode, onTurn) {
   assert.equal(last.finish, true)
   assert.ok(!last.content.includes('正在调用工具'), `收尾绝不能回显工具标记：${last.content}`)
   assert.match(last.content, /未返回文本结果|未生成回复/, `应给明确提示而非冻结：${last.content}`)
+}
+
+// 8. 长任务（超过流式窗口）：最终答案改由主动推送消息送达，绝不原地 finish 已死/濒死的流式消息
+//    复现用户真实场景：dsh 跑了 10.66 分钟，远超企微 10 分钟流式硬上限。
+{
+  const longTaskMs = 50
+  const ctx = makeCtx({ onTurn: (sid, { streamListeners, sessionListeners, agent }) => {
+    stream(streamListeners, agent, { type: 'start', turn: 1 })
+    stream(streamListeners, agent, { type: 'chunk', turn: 1, chunk: { type: 'text-delta', text: '部分进度…' } })
+    // 关键：回合在 longTaskMs 之后才真正结束（模拟超长耗时）
+    setTimeout(() => {
+      stream(streamListeners, agent, { type: 'chunk', turn: 1, chunk: { type: 'text-delta', text: '最终结论' } })
+      session(sessionListeners, sid, { type: 'assistant/message', data: { turn: 1, message: { content: [{ type: 'text', text: '最终结论' }] } } })
+      session(sessionListeners, sid, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    }, longTaskMs + 80)
+  } })
+  const ws = makeWs()
+  const bridge = new SessionBridge(ctx, { preset: 'standard', replyMode: 'stream' }, { longTaskMs, hardTimeoutMs: 5000 })
+  bridge.handle(packet('m-long', '做个长调研'), ws)
+  for (let i = 0; i < 100 && !ws.frames.some((f) => f.proactive && f.content.includes('最终结论')); i++) {
+    await new Promise((r) => setTimeout(r, 10))
+  }
+  await bridge.dispose()
+  const finalProactive = ws.frames.find((f) => f.proactive && f.content.includes('最终结论'))
+  assert.ok(finalProactive, `长任务最终结论应经主动推送送达：${JSON.stringify(ws.frames)}`)
+  assert.ok(!ws.frames.some((f) => f.finish), '长任务不应原地 finish 已逝的流式消息（否则结论会被截断）')
+  assert.ok(ws.frames.some((f) => f.proactive && f.content.includes('任务还在处理中')), '应发过一次长任务提示，告知用户结论将以新消息送达')
 }
 
 console.log('check-reply: OK')

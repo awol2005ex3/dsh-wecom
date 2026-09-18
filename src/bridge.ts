@@ -9,17 +9,34 @@ import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import { createUserMessage, errorChain } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import { WsClient, WecomCallbackPacket } from './ws.js'
+import { WsClient, WecomCallbackPacket, type WecomSendTarget } from './ws.js'
 import { LRUCache } from './lru.js'
 import { SessionQueue } from './queue.js'
 import { MediaHandler } from './media.js'
 import { debugLog } from './debuglog.js'
 
 /**
- * 单个 agent 回合等待的兜底超时。
- * 企微从流式首帧起 10 分钟后强制结束消息，这里取一半作为安全余量。
+ * 企微流式消息硬上限：从首帧起 10 分钟内必须 finish=true，否则企微自动结束消息
+ * （见 ws.ts `createStreamResponder` 注释）。之后该流式消息即「死亡」，再发任何帧都被忽略。
  */
-const TURN_TIMEOUT_MS = 5 * 60_000
+const STREAM_MAX_MS = 10 * 60_000
+
+/**
+ * 长任务阈值：一个回合耗时超过此值，即视为会超出流式窗口，
+ * 最终答案改为「主动推送消息」（aibot_send_msg）送达，而非原地 finish 已死/濒死的流式消息。
+ * 取值须严格 < STREAM_MAX_MS：这样走主动推送分支时，原流式消息【尚未】被企微强制结束，
+ * 不会出现「流式消息里的旧终稿 + 主动推送的新终稿」重复投递。
+ */
+const LONG_TASK_MS = 9 * 60_000
+
+/**
+ * 兜底硬超时：若回合迟迟不结束（agent 卡死 / 上游 hang），到此强制收尾并主动推送超时提示，
+ * 避免 per-session 队列被一条永不 resolve 的 promise 永久阻塞。远大于流式窗口，仅作最后保险。
+ */
+const HARD_TIMEOUT_MS = 15 * 60_000
+
+/** 长任务提示：跨越阈值且回合尚未结束时主动推送一次，告知用户结论将以新消息送达。 */
+const LONG_TASK_HINT = '⏳ 任务还在处理中，预计耗时超过 10 分钟；跑完后我会用一条新消息把完整结论发给你。'
 
 /** 流式长空窗保活间隔（思考初期 / 工具调用执行中等无 chunk 的间隙）。 */
 const KEEPALIVE_MS = 4_000
@@ -35,6 +52,8 @@ export type StreamResponder = ReturnType<WsClient['createStreamResponder']>
  */
 interface ActiveTurn {
   responder: StreamResponder
+  /** 本次消息对应的长连接客户端（用于超时/长任务时主动推送新消息）。 */
+  ws: WsClient
   streamMode: boolean
   /** 该回合归属的 agent（用于按 agent 过滤 `agent/assistant-stream`）。 */
   agent: Agent
@@ -47,8 +66,17 @@ interface ActiveTurn {
   /** 本轮已展示过「正在调用工具」标记的工具名（避免重复刷）。 */
   toolCallsShown: Set<string>
   settled: boolean
+  /** 流式首帧时刻（用于判断回合是否超出 10 分钟流式窗口，决定 finish 还是主动推送）。 */
+  streamStartTs: number
+  /** 主动推送目标（单聊 userid / 群聊 chatid），长任务最终结论由此送达。 */
+  target: WecomSendTarget
+  /** 是否已发过「长任务提示」（避免重复推送）。 */
+  hintSent: boolean
   resolve: () => void
-  timer: ReturnType<typeof setTimeout>
+  /** 兜底硬超时定时器（agent 卡死时强制收尾）。 */
+  hardTimer: ReturnType<typeof setTimeout>
+  /** 长任务提示定时器（跨越阈值时主动告知用户）。 */
+  hintTimer: ReturnType<typeof setTimeout>
   heartbeat: ReturnType<typeof setInterval>
 }
 
@@ -89,7 +117,12 @@ export class SessionBridge {
   /** 已注册 agent/assistant-stream 监听的 agent（按对象去重）。 */
   private agentStreams = new WeakSet<object>()
 
-  constructor(private ctx: Context, private cfg: any) {
+  constructor(
+    private ctx: Context,
+    private cfg: any,
+    /** 超时覆盖（仅测试用，便于快速触发长任务/硬超时分支）。生产路径不传，走默认常量。 */
+    private opts: { longTaskMs?: number; hardTimeoutMs?: number } = {},
+  ) {
     this.media = new MediaHandler({
       sandboxRoot: this.workspaceRoot(),
     })
@@ -249,6 +282,13 @@ export class SessionBridge {
 
   /** 释放本 bridge 创建的全部 agent（插件卸载 / 配置热更新时调用）。 */
   async dispose() {
+    // 先清掉活跃回合的定时器，避免卸载/热重启后孤儿定时器继续触发主动推送
+    for (const at of this.activeTurns.values()) {
+      clearTimeout(at.hintTimer)
+      clearTimeout(at.hardTimer)
+      clearInterval(at.heartbeat)
+    }
+    this.activeTurns.clear()
     for (const [sessionId, entry] of this.agents) {
       if (!entry.owned) continue
       try {
@@ -268,8 +308,17 @@ export class SessionBridge {
 
     // 0. 立刻开一条流式消息占位：企微要求回调后 5 秒内回一帧，
     //    否则 req_id 失效、后续所有回复帧都会被丢弃（用户侧一直停在 "…"）。
-    //    之后所有出口（成功/失败/超时）都用 finish 收尾，占位内容会被原位替换。
+    //    之后所有出口（成功/失败/超时/长任务）都用 finish 或主动推送收尾，占位内容会被原位替换。
     const responder = ws.createStreamResponder(reqId)
+
+    // 0.1 计算主动推送目标（长任务最终结论的送达地址）：
+    //     单聊 → from.userid / chat_type=1；群聊 → chatid / chat_type=2。
+    const target: WecomSendTarget = body.chattype === 'group'
+      ? { chatid: body.chatid, chatType: 2 }
+      : { chatid: body.from.userid, chatType: 1 }
+    const streamStartTs = Date.now()
+    const longTaskMs = this.opts.longTaskMs ?? LONG_TASK_MS
+    const hardTimeoutMs = this.opts.hardTimeoutMs ?? HARD_TIMEOUT_MS
 
     // 1. 构造 Agent 输入
     let content: string
@@ -304,35 +353,52 @@ export class SessionBridge {
     //    - `agent/assistant-stream`：真正的实时增量通道（reasoning-delta / text-delta）。
     //      `session/event` 总线【从不】携带增量块，只有回合结束的 assistant/message。
     //    - `session/event`：仅用于干净终稿（assistant/message）与回合错误（turn/end）。
+    let activeAt: ActiveTurn | undefined
+    let activeSid: string | undefined
     try {
       const handle = await this.ensureAgent(sessionId)
       this.registerAgentStream(handle.agent)                  // 实时流式通道
       this.registerSessionListener((handle.agent as any).ctx) // 终稿 + 错误兜底
       const sid = String(handle.agent.session.id)
+      activeSid = sid
       const streamMode = this.cfg.replyMode === 'stream'
       debugLog(`[proc] sessionId=${sessionId} sid=${sid} streamMode=${streamMode}`)
 
       const turn = new Promise<void>((resolve) => {
         const at: ActiveTurn = {
-          responder, streamMode, agent: handle.agent,
+          responder, ws, streamMode, agent: handle.agent,
           nText: 0, nReason: 0,
           cleanText: '', answering: false, toolCallsShown: new Set(),
-          settled: false, resolve,
-          timer: setTimeout(() => {
+          settled: false, streamStartTs, target, hintSent: false, resolve,
+          // 兜底硬超时：agent 卡死时强制收尾，避免队列永久阻塞
+          hardTimer: setTimeout(() => {
             if (at.settled) return
             at.settled = true
+            clearTimeout(at.hintTimer)
             clearInterval(at.heartbeat)
             this.activeTurns.delete(sid)
-            debugLog(`[turn] TIMEOUT sid=${sid} mode=${streamMode} text=${at.nText} reason=${at.nReason}`)
-            at.responder.finish(at.cleanText || '处理超时，请稍后再试')
+            debugLog(`[turn] HARD_TIMEOUT sid=${sid} mode=${streamMode} text=${at.nText} reason=${at.nReason}`)
+            at.ws.sendProactiveMarkdown(
+              at.target,
+              `⚠️ 处理超时（超过 ${Math.round(hardTimeoutMs / 60000)} 分钟），请稍后重试或简化问题。`,
+            )
             resolve()
-          }, TURN_TIMEOUT_MS),
+          }, hardTimeoutMs),
+          // 长任务提示：跨越阈值且回合未结束时主动告知用户，结论将以新消息送达
+          hintTimer: setTimeout(() => {
+            if (at.settled || at.hintSent) return
+            at.hintSent = true
+            debugLog(`[turn] HINT sid=${sid}`)
+            at.ws.sendProactiveMarkdown(at.target, LONG_TASK_HINT)
+          }, longTaskMs),
           heartbeat: setInterval(() => {
-            // 长空窗保活：keepAlive 内部仅在自身 buf 为空（尚未流出任何内容）时重发占位帧，
-            // 一旦 append/reset 过真实内容就自动停，不会覆盖已流式内容。
-            if (!at.settled) at.responder.keepAlive()
+            if (at.settled) return
+            // 流式消息已被企微强制结束（超过 10 分钟窗口）后，再发也无效，停掉省流量
+            if (Date.now() - at.streamStartTs >= STREAM_MAX_MS) return
+            at.responder.keepAlive()
           }, KEEPALIVE_MS),
         }
+        activeAt = at
         this.activeTurns.set(sid, at)
       })
 
@@ -343,7 +409,12 @@ export class SessionBridge {
       await turn
     } catch (err: any) {
       debugLog(`[process] error: ${errorMessage(err)}`)
-      responder.finish(`处理失败：${errorChain(err)}`)
+      // at 已建好则走统一收尾（会按耗时决定 finish / 主动推送），否则直接 finish 占位流
+      if (activeAt && activeSid && !activeAt.settled) {
+        this.settleTurn(activeAt, activeSid, `处理失败：${errorChain(err)}`)
+      } else {
+        responder.finish(`处理失败：${errorChain(err)}`)
+      }
     }
   }
 
@@ -431,36 +502,62 @@ export class SessionBridge {
     if (event.type === 'turn/end') {
       const reason = event.data.reason
       if (reason?.kind === 'error') {
-        at.settled = true
-        clearTimeout(at.timer)
-        clearInterval(at.heartbeat)
-        this.activeTurns.delete(String(session.id))
-        debugLog(`[turn] ERROR sid=${String(session.id)} msg=${reason.error?.message ?? 'agent turn failed'} clean=${at.cleanText.length}`)
-        at.responder.finish(`处理失败：${reason.error?.message ?? 'agent turn failed'}`)
-        at.resolve()
+        this.settleTurn(at, String(session.id), `处理失败：${reason.error?.message ?? 'agent turn failed'}`)
         return
       }
-      // 非错误收尾（如被取消 / 本次尝试被 defer 后没再产生消息）：以当前已有内容兜底，不无限挂起
-      if (at.settled) return
-      at.settled = true
-      clearTimeout(at.timer)
-      clearInterval(at.heartbeat)
-      this.activeTurns.delete(String(session.id))
-      debugLog(`[turn] END sid=${String(session.id)} reason=${reason?.kind} 兜底收尾 clean=${at.cleanText.length}`)
-      at.responder.finish(this.finalContent(at))  // 未带 cleanText 时走 finalContent 兜底逻辑
-      at.resolve()
+      // 非错误收尾（completed / 被取消等）：以当前已有内容兜底收尾
+      this.settleTurn(at, String(session.id))
     }
   }
 
   /**
-   * 收尾内容选择器：干净终稿 > 已流式答案(buf) > 明确提示。
+   * 回合收尾：清定时器、删活跃表，并按「耗时是否超出流式窗口」决定两种送达方式之一：
+   *
+   * - 耗时 < 长任务阈值（流式消息仍存活）→ 原地 `responder.finish(content)`，
+   *   内容原位替换占位帧（正常路径，绝大多数短/中任务走这里）。
+   * - 耗时 >= 长任务阈值（已超出/临近企微 10 分钟流式硬上限，原消息随时被强制结束）→
+   *   改用 `aibot_send_msg` 把最终结论作为「一条新消息」主动推送给用户（方案 2：
+   *   长任务不被 10 分钟窗口掐断，最终答案完整送达）。
+   *
+   * explicitText 由错误/超时分支传入；成功收尾不传，由 finalString 取干净终稿/已流式答案。
+   */
+  private settleTurn(at: ActiveTurn, sessionId: string, explicitText?: string) {
+    if (at.settled) return
+    at.settled = true
+    clearTimeout(at.hintTimer)
+    clearTimeout(at.hardTimer)
+    clearInterval(at.heartbeat)
+    this.activeTurns.delete(sessionId)
+
+    const content = explicitText ?? this.finalString(at)
+    const elapsed = Date.now() - at.streamStartTs
+    const longTaskMs = this.opts.longTaskMs ?? LONG_TASK_MS
+    const proactive = elapsed >= longTaskMs
+    debugLog(`[turn] END sid=${sessionId} elapsed=${Math.round(elapsed / 1000)}s proactive=${proactive} clean=${at.cleanText.length}`)
+
+    if (proactive) {
+      at.ws.sendProactiveMarkdown(at.target, content)
+    } else {
+      at.responder.finish(content)
+    }
+    at.resolve()
+  }
+
+  /**
+   * 收尾内容选择器（始终返回具体字符串，供流式 finish 与主动推送共用）：
+   * 干净终稿 > 已流式答案(buf) > 明确提示。
    * 关键：当本轮没有任何文本答案（模型只思考 + 调工具后因工具失败而中断，
    * cleanText 为空、nText=0）时，【绝不】把「⏳ 正在调用工具：xxx…」标记当最终内容回显
    * ——否则用户看到的就是「卡在工具标记上、像断了」。改用一句明确提示。
    */
-  private finalContent(at: ActiveTurn): string | undefined {
+  private finalString(at: ActiveTurn): string {
     if (at.cleanText && at.cleanText.trim()) return at.cleanText
-    if (at.nText > 0) return undefined  // 交给 responder.finish 用内部 buf（首个 text-delta 已 reset 为纯答案）
+    // 仅当确实流出过文本答案（nText>0）时才用 buf：此时首个 text-delta 已把 buf reset 成纯答案。
+    // 否则 buf 里只是「思考文本 + 正在调用工具标记」，绝不能当作终稿回显（见测试 7）。
+    if (at.nText > 0) {
+      const buf = at.responder.buffer
+      if (buf && buf.trim()) return buf
+    }
     if (at.toolCallsShown.size > 0) {
       return `⚠️ 已调用工具（${[...at.toolCallsShown].join('、')}）但未返回文本结果，请稍后重试或更换问题。`
     }
