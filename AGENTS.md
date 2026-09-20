@@ -18,7 +18,7 @@
 | `src/bridge.ts` | `SessionBridge` — 消息分发、白名单、幂等去重、会话队列、Agent 创建与事件驱动回复协调。核心桥接层。 |
 | `src/settings.ts` | `WecomSettings` + `WecomSettingsSchema`（schemastery），由 `ctx.settings.register('wecom', ..., { applies: 'live' })` 注册，改配置即热重启服务。 |
 | `src/rpc.ts` | **宿主半 RPC**：`registerRpcHandler()` 用 `connection.fetch.register()` 挂 `/api/wecom-rpc/{get,update}`，供浏览器配置面板读写设置。 |
-| `src/client.ts` | **浏览器半**（经 `scripts/wrap-client.mjs` 包成 CJS 闭包工厂）。侧边栏入口「⚙ 企微」→ 配置面板。 |
+| `src/client.ts` | **浏览器半**（经 `scripts/wrap-client.mjs` 包成 CJS 闭包工厂）。主路径：用浏览器 slots 服务把配置面板注册进 dsh 自身设置页「设置 → 插件 → 插件配置」（`settings.plugin.item` 卡片，key=`'wecom'` 须命中宿主 `ctx.settings.register` 的命名空间；退路 `settings.section` 独立分区），面板经 React 壳组件挂载真实 DOM。slots/React 不可用时回退旧行为：侧边栏「⚙ 企微」启动器 + 浮动面板。参考实现见 `../dsh-logo-custom/src/client.ts`。 |
 | `src/debuglog.ts` | `debugLog` / `tee` — 受 `DSH_WECOM_DEBUG` 控制的落盘诊断日志。 |
 | `lib/` | tsc 构建产物（.js + .d.ts），`package.json` 的 `files` 仅包含 `lib`。 |
 | `docs/dsh-plugin-wecom-完整方案.md` | 方案设计文档（M1–M5 分阶段验证清单、协议要点、待核对字段）。 |
